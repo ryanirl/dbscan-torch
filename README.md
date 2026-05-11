@@ -17,6 +17,18 @@ CPU-only wheels work out of the box on Linux and macOS (not tested in Windows).
 Building with CUDA requires the CUDA toolkit and a CUDA-enabled torch install at
 build time.
 
+### Installing alongside a pinned torch
+
+The C++ extension is built against whatever torch lands in pip's isolated
+build environment. If your runtime env has torch pinned to a version that
+differs from "latest in the supported range," the build will compile
+against the build-env torch and fail to import against your runtime torch
+(PyTorch does not preserve binary compatibility across minor versions).
+`dbscan-torch` detects this on import and tells you exactly what to do.
+The fix is to build against your existing torch:
+
+    pip install --no-build-isolation dbscan-torch
+
 ## Use
 
 ```python

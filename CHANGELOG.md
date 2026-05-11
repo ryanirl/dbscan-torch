@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-05-10
+
+### Added
+- Build-time torch version is stamped into the package (generated
+  `_build_info.py`). `__init__.py` checks it against the runtime
+  `torch.__version__` on import and raises a clear, actionable `ImportError`
+  if the major.minor differs, instead of the cryptic `undefined symbol:
+  _ZN3c10...` from libc10.
+- README guidance on installing alongside a pinned torch via
+  `pip install --no-build-isolation dbscan-torch`.
+
+### Fixed
+- CI workflow and `[build-system].requires` now pin torch to the same range
+  as `[project].dependencies` (`torch>=2.0,<2.8`). Prevents a build-vs-runtime
+  ABI mismatch when pip's isolated build env would otherwise pull a newer
+  torch than the runtime env.
+
 ## [0.1.0] - 2026-05-07
 
 Initial release.
