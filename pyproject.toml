@@ -1,5 +1,9 @@
 [build-system]
-requires = ["setuptools>=61", "wheel", "torch>=2.0"]
+# Keep this range in sync with [project].dependencies below. The C++ extension
+# is built against whatever torch lands in the isolated build env, so if the
+# build-env torch is newer than the runtime torch, the resulting `.so` will
+# reference symbols (e.g. libc10 ABI) that don't exist at import time.
+requires = ["setuptools>=61", "wheel", "torch>=2.0,<2.8"]
 build-backend = "setuptools.build_meta"
 
 [project]
