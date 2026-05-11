@@ -1,0 +1,59 @@
+# Run the test suite on every push and PR.
+#
+# CPU-only -- GitHub doesn't offer free GPU runners. The CUDA path is
+# exercised manually via `modal run dev/modal_app.py --action test` (the
+# Modal runner is dev-only and lives outside the published sdist). The
+# CPU/CUDA parity test in the suite ensures the two implementations agree,
+# so CPU regressions caught here are a strong signal for the CUDA path too.
+
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Allow manual runs from the Actions tab (useful for debugging).
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: pytest ${{ matrix.os }} / py${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install torch (CPU build) + pip upgrade
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            # Linux: prefer the explicit CPU index so we don't pull a
+            # multi-GB CUDA-enabled wheel we won't use.
+            pip install torch --index-url https://download.pytorch.org/whl/cpu
+          else
+            # macOS torch on PyPI is always CPU-only.
+            pip install torch
+          fi
+
+      - name: Build extension + install test extras
+        run: pip install -e ".[test]"
+
+      - name: Show environment
+        run: |
+          python -c "import torch; print('torch', torch.__version__)"
+          python -c "import dbscan_torch; print('dbscan_torch', dbscan_torch.__version__)"
+
+      - name: Run pytest
+        run: pytest tests/ -v --tb=short

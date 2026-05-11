@@ -1,0 +1,101 @@
+"""dbscan_torch build script.
+
+Detects CUDA at build time:
+  * CUDAExtension if torch was built with CUDA *and* CUDA_HOME is set, OR if
+    FORCE_CUDA=1 is set in the environment (escape hatch for build hosts where
+    CUDA_HOME isn't auto-detected, e.g. CI runners with the toolkit on a
+    non-standard path).
+  * CppExtension otherwise. CPU-only machines build and run with no CUDA
+    toolkit installed.
+
+The WITH_CUDA macro is defined only on the CUDA build path. csrc/extension.cpp
+guards the GPU dispatch arm with `#ifdef WITH_CUDA` so the CPU build has no
+unresolved symbols.
+
+CUDA architecture targets:
+  Set the standard ``TORCH_CUDA_ARCH_LIST`` env var to control which compute
+  capabilities get baked into the binary. torch's CUDAExtension consults this
+  directly. We deliberately don't pass ``-gencode`` flags here so the env var
+  remains the single source of truth. Examples:
+    TORCH_CUDA_ARCH_LIST="8.6"               # build only for the local GPU
+    TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9;9.0"  # the distribution default
+  If unset, torch auto-detects from the available device. The wheels CI sets
+  it explicitly so distributed wheels cover the canonical arch list.
+"""
+
+import torch
+import sys
+import os
+
+from setuptools import setup
+
+from torch.utils.cpp_extension import BuildExtension
+from torch.utils.cpp_extension import CppExtension
+from torch.utils.cpp_extension import CUDAExtension
+from torch.utils.cpp_extension import CUDA_HOME
+
+_force_cuda = os.environ.get("FORCE_CUDA", "0") == "1"
+_torch_has_cuda = torch.version.cuda is not None
+WITH_CUDA = _force_cuda or (_torch_has_cuda and CUDA_HOME is not None)
+
+cpu_sources = [
+    "csrc/extension.cpp",
+    "csrc/cpu/dbscan_cpu.cpp",
+]
+cuda_sources = ["csrc/cuda/dbscan_cuda.cu"] if WITH_CUDA else []
+
+# OpenMP: dbscan_grid.hpp uses `#pragma omp parallel for schedule(dynamic)` on
+# the load-imbalanced loops. Apple clang needs `-Xpreprocessor -fopenmp` and
+# the libomp runtime. GCC/Linux just needs `-fopenmp`.
+if sys.platform == "darwin":
+    # Apple clang needs the preprocessor flag to recognize OpenMP pragmas. We
+    # do NOT link a separate libomp -- torch already ships and loads its own
+    # OpenMP runtime, and double-loading the runtime crashes the process at
+    # the first parallel region.
+    _omp_cxx = ["-Xpreprocessor", "-fopenmp"]
+    _omp_link = []
+    for prefix in ("/usr/local/opt/libomp", "/opt/homebrew/opt/libomp", "/usr/local/opt/llvm"):
+        if os.path.isdir(prefix):
+            _omp_cxx += [f"-I{prefix}/include"]
+            break
+else:
+    _omp_cxx = ["-fopenmp"]
+    _omp_link = ["-fopenmp"]
+
+extra_compile_args = {
+    "cxx": ["-O3", "-std=c++17"] + _omp_cxx,
+}
+extra_link_args = list(_omp_link)
+define_macros = []
+if WITH_CUDA:
+    define_macros.append(("WITH_CUDA", None))
+    extra_compile_args["nvcc"] = [
+        "-O3",
+        "--use_fast_math",
+        "-std=c++17",
+        # No -gencode flags here -- TORCH_CUDA_ARCH_LIST is the source of truth.
+        # See the module docstring for usage.
+    ]
+
+ExtCls = CUDAExtension if WITH_CUDA else CppExtension
+
+ext_modules = [
+    ExtCls(
+        name="dbscan_torch._C",
+        sources=cpu_sources + cuda_sources,
+        include_dirs=[os.path.abspath("csrc")],
+        define_macros=define_macros,
+        extra_compile_args=extra_compile_args,
+        extra_link_args=extra_link_args,
+    ),
+]
+
+setup(
+    # Name, version, and most metadata live in pyproject.toml.
+    # setup.py is here only for the CUDA-aware ext_modules / BuildExtension hook.
+    ext_modules=ext_modules,
+    cmdclass={"build_ext": BuildExtension},
+    zip_safe=False,
+)
+
+

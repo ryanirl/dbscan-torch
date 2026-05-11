@@ -1,0 +1,46 @@
+benchmarks/
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+
+# Build artifacts
+build/
+dist/
+wheelhouse/
+*.so
+*.dylib
+*.dll
+*.pyd
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Modal logs (if any)
+.modal/
+
+# Local dev / planning docs / Modal runner -- not part of the public repo.
+dev/

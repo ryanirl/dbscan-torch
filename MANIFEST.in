@@ -1,0 +1,21 @@
+include README.md
+include LICENSE
+include CHANGELOG.md
+include pyproject.toml
+include setup.py
+
+# C++ / CUDA sources have to ship in the sdist or nvcc has nothing to compile
+# on the user's machine.
+recursive-include csrc *.cpp *.cu *.hpp *.cuh *.h
+
+# PEP 561 marker so type checkers see the inline annotations in __init__.py.
+include dbscan_torch/py.typed
+
+# Tests are useful so users can run `pytest --pyargs dbscan_torch` after
+# install. Benchmarks and dev tooling stay out of the sdist.
+recursive-include tests *.py
+
+global-exclude __pycache__
+global-exclude *.py[co]
+global-exclude *.so
+global-exclude .DS_Store
