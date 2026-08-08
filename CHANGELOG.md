@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Performance, CUDA (1.4-2.2x on every benchmarked config; 10M points now
+  runs in 5-21ms on an RTX 3090 across all four benchmark distributions):
+  - Cell union runs in two phases with a flat thread mapping: the 8
+    touching neighbors first, a flatten, then the 16 outer offsets, which
+    mostly exit at the already-united check.
+  - Narrow-key fast path: for large inputs whose occupied grid spans fewer
+    than 2^16 cells per axis, keys pack as 16+16-bit offsets and
+    cub::DeviceRadixSort runs over 32 bits instead of 64. Wide grids and
+    small inputs keep the original packing (regression-tested).
+  - Core marking pass 2 visits the center cell and ring 1 before ring 2,
+    so the min_samples early exit fires sooner.
+- Performance, CPU (1.5-1.8x at 10M; up to 2x at smaller N):
+  - The neighbor table is built by a column-pair merge-join over the
+    sorted cells instead of 25 hashmap probes per cell.
+  - The cell-boundary scan is a parallel chunked two-pass (fixed chunk
+    grid, so output stays bit-identical under any thread count).
+  - On the narrow-key path, a hand-rolled stable 2-pass parallel radix
+    sort replaces at::sort and yields the permutation directly.
+- Cluster ids can renumber relative to 0.2.0 (cell visit order changed);
+  partitions are unchanged and runs remain bit-deterministic.
+
+### Added
+- Wide-grid fallback regression tests (inputs spanning more than 2^16
+  cells per axis above the narrow-key detection thresholds).
+
 ## [0.2.0] - 2026-08-08
 
 ### Fixed

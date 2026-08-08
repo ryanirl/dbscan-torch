@@ -3,15 +3,23 @@
 // Pipeline (all buffers live on device, we only copy the scalar num_cells to
 // the host, since we need it to size num_cells-wide kernel launches):
 //
-//   1.  cell keys + perm                 (k_cell_keys)
-//   2.  thrust::sort_by_key(keys, perm), gather sorted xs/ys (k_gather_xy)
+//   0.  (large inputs) grid extent for the narrow-key fast path
+//                                        (k_grid_minmax)
+//   1.  cell keys + perm                 (k_cell_keys; 32-bit offset packing
+//                                         when the grid fits 2^16 per axis,
+//                                         64-bit otherwise)
+//   2.  cub radix sort with an explicit bit range, gather sorted xs/ys
+//                                        (cub::DeviceRadixSort, k_gather_xy)
 //   3.  boundary flags + inclusive scan -> point_cell, num_cells, cell_start,
-//       cell_keys                        (k_boundary_flags, scan, k_extract*)
+//       cell_keys, per-cell bounding boxes
+//                                        (k_boundary_flags, scan, k_extract*,
+//                                         k_cell_bbox)
 //   4.  neighbor table via 25 binary searches per cell (k_build_ngh)
-//   5.  core marking pass 1 (full cells), pass 2 (per-point sweep)
-//                                        (k_core_pass1, k_core_pass2,
+//   5.  core marking pass 1 (full cells), pass 2 (per-point sweep,
+//       center-first order, bbox-pruned) (k_core_pass1, k_core_pass2,
 //                                         k_cell_status)
-//   6.  cell-level union-find (atomic-CAS unite, path-halving find)
+//   6.  cell-level union-find, two-phase (ring 1, flatten, ring 2), with
+//       bbox pruning and already-united skip
 //                                        (k_uf_init, k_unite_pairs,
 //                                         k_uf_flatten)
 //   7.  cluster id renumbering via exclusive scan over root_flag
@@ -22,15 +30,17 @@
 //                                        (k_border_assign)
 //  10.  unpermute back to input order    (k_unpermute)
 //
-// See csrc/cpu/dbscan_grid.hpp for the reference CPU algorithm. The kernels
-// mirror that file step for step. The one structural change is the
-// hashmap-free neighbor lookup (binary search over cell_keys, which are
-// already sorted by stage 2).
+// See csrc/cpu/dbscan_grid.hpp for the reference CPU algorithm. The stages
+// correspond one to one, though the per-stage tactics differ where the
+// hardware demands it (binary-search neighbor lookup here vs the CPU's
+// merge-join; cub radix here vs the CPU's hand-rolled 2-pass radix).
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_runtime.h>
 #include <torch/extension.h>
+
+#include <cub/device/device_radix_sort.cuh>
 
 #include <thrust/device_ptr.h>
 #include <thrust/execution_policy.h>
@@ -50,10 +60,50 @@ __device__ __forceinline__ uint64_t pack_key(int32_t kx, int32_t ky) {
 }
 
 // ============================================================================
-// Stage 1: cell keys + perm
+// Stage 0 (large inputs only): kx/ky range, for the narrow-key fast path.
+//
+// When the occupied grid spans fewer than 2^16 cells per axis (any realistic
+// dataset), the keys are packed as 16+16-bit offsets from (min_kx, min_ky)
+// into the LOW 32 bits, and the radix sort runs over 32 instead of 64 bits,
+// which halves its passes. Wide grids and small inputs (where the extra
+// reduction + host sync would not pay) keep the original 64-bit packing.
+// ============================================================================
+__global__ void k_grid_minmax(const float* __restrict__ X, int32_t n,
+                              float inv_r, int32_t* __restrict__ minmax) {
+  __shared__ int32_t red[4];  // min_kx, max_kx, min_ky, max_ky
+  if (threadIdx.x == 0) {
+    red[0] = INT32_MAX;
+    red[1] = INT32_MIN;
+    red[2] = INT32_MAX;
+    red[3] = INT32_MIN;
+  }
+  __syncthreads();
+  int32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) {
+    int32_t kx = static_cast<int32_t>(floorf(X[2 * i + 0] * inv_r));
+    int32_t ky = static_cast<int32_t>(floorf(X[2 * i + 1] * inv_r));
+    atomicMin(&red[0], kx);
+    atomicMax(&red[1], kx);
+    atomicMin(&red[2], ky);
+    atomicMax(&red[3], ky);
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    atomicMin(&minmax[0], red[0]);
+    atomicMax(&minmax[1], red[1]);
+    atomicMin(&minmax[2], red[2]);
+    atomicMax(&minmax[3], red[3]);
+  }
+}
+
+// ============================================================================
+// Stage 1: cell keys + perm. ``shift`` selects the packing: 32 is the
+// original (kx | ky as uint32 halves, mins are 0), 16 is the narrow path
+// (16-bit offsets from the grid minimum, key fits in the low 32 bits).
 // ============================================================================
 __global__ void k_cell_keys(const float* __restrict__ X, int32_t n,
-                            float inv_r, uint64_t* __restrict__ keys,
+                            float inv_r, int32_t min_kx, int32_t min_ky,
+                            int32_t shift, uint64_t* __restrict__ keys,
                             int32_t* __restrict__ perm) {
   int32_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
@@ -61,7 +111,9 @@ __global__ void k_cell_keys(const float* __restrict__ X, int32_t n,
   float y = X[2 * i + 1];
   int32_t kx = static_cast<int32_t>(floorf(x * inv_r));
   int32_t ky = static_cast<int32_t>(floorf(y * inv_r));
-  keys[i] = pack_key(kx, ky);
+  uint32_t okx = static_cast<uint32_t>(kx - min_kx);
+  uint32_t oky = static_cast<uint32_t>(ky - min_ky);
+  keys[i] = (static_cast<uint64_t>(okx) << shift) | static_cast<uint64_t>(oky);
   perm[i] = i;
 }
 
@@ -135,17 +187,32 @@ __device__ int32_t binsearch_cell(const uint64_t* keys, int32_t num_cells,
 }
 
 __global__ void k_build_ngh(const uint64_t* __restrict__ cell_keys,
-                            int32_t num_cells, int32_t* __restrict__ ngh) {
+                            int32_t num_cells, int32_t shift,
+                            int32_t* __restrict__ ngh) {
   int64_t t = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (t >= static_cast<int64_t>(num_cells) * 25) return;
   int32_t c = static_cast<int32_t>(t / 25);
   int32_t off = static_cast<int32_t>(t % 25);
   uint64_t self_key = cell_keys[c];
-  int32_t kx = static_cast<int32_t>(static_cast<uint32_t>(self_key >> 32));
-  int32_t ky = static_cast<int32_t>(static_cast<uint32_t>(self_key));
-  int32_t dx = (off / 5) - 2;
-  int32_t dy = (off % 5) - 2;
-  uint64_t target = pack_key(kx + dx, ky + dy);
+  int64_t okx = static_cast<int64_t>(self_key >> shift);
+  int64_t oky = static_cast<int64_t>(self_key & ((1ull << shift) - 1));
+  int64_t tx = okx + (off / 5) - 2;
+  int64_t ty = oky + (off % 5) - 2;
+
+  uint64_t target;
+  if (shift == 16) {
+    // Narrow packing: offsets are 16-bit, so a neighbor coordinate outside
+    // [0, 2^16) cannot exist (and letting it wrap would corrupt the okx
+    // field of the packed target).
+    if (tx < 0 || tx >= 65536 || ty < 0 || ty >= 65536) {
+      ngh[c * 25 + off] = -1;
+      return;
+    }
+    target = (static_cast<uint64_t>(tx) << 16) | static_cast<uint64_t>(ty);
+  } else {
+    // Original 64-bit packing: uint32 wraparound reproduces pack_key exactly.
+    target = pack_key(static_cast<int32_t>(tx), static_cast<int32_t>(ty));
+  }
   ngh[c * 25 + off] = binsearch_cell(cell_keys, num_cells, target);
 }
 
@@ -210,6 +277,9 @@ __global__ void k_core_pass1(const int32_t* __restrict__ cell_start,
 // ============================================================================
 // Stage 5b: pass 2 -- per-point neighbor count over the 5x5 cell window.
 // ============================================================================
+__device__ const int32_t kCoreScanOrder[25] = {
+    12, 6, 7,  8,  11, 13, 16, 17, 18, 0,  1,  2, 3,
+    4,  5, 9, 10, 14, 15, 19, 20, 21, 22, 23, 24};
 __global__ void k_core_pass2(const float* __restrict__ xs,
                              const float* __restrict__ ys,
                              const int32_t* __restrict__ cell_start,
@@ -225,7 +295,12 @@ __global__ void k_core_pass2(const float* __restrict__ xs,
   float xi = xs[i], yi = ys[i];
   const int32_t* row = ngh + c * 25;
   int32_t cnt = 0;
-  for (int32_t off = 0; off < 25; ++off) {
+  // Center cell first, then ring 1, then ring 2: nearby cells contribute
+  // the most eps-neighbors, so the min_samples early exit usually fires
+  // before the mostly-out-of-range ring-2 scans start. The count is
+  // commutative, so the visit order cannot change the outcome.
+  for (int32_t k = 0; k < 25; ++k) {
+    int32_t off = kCoreScanOrder[k];
     int32_t nc = row[off];
     if (nc < 0) continue;
     if (off == 12) {
@@ -585,20 +660,65 @@ static torch::Tensor dbscan2d_cuda_impl(torch::Tensor X, double eps,
 
   // ---------------------------------------------------------------- stage 1
   stage_mark(0);
+  // Narrow-key detection (see k_grid_minmax). Only for large inputs: the
+  // reduction plus its host sync is fixed latency that small calls would
+  // pay without recouping in the sort.
+  int32_t min_kx = 0, min_ky = 0;
+  int32_t key_shift = 32;
+  constexpr int32_t kNarrowMinN = 1 << 19;
+  if (n >= kNarrowMinN) {
+    auto minmax = torch::empty({4}, opts_i32);
+    const int32_t init_vals[4] = {INT32_MAX, INT32_MIN, INT32_MAX, INT32_MIN};
+    C10_CUDA_CHECK(cudaMemcpy(minmax.data_ptr<int32_t>(), init_vals,
+                              sizeof(init_vals), cudaMemcpyHostToDevice));
+    k_grid_minmax<<<grid(n), kBlk, 0, stream>>>(X.data_ptr<float>(), n, inv_r,
+                                                minmax.data_ptr<int32_t>());
+    int32_t mm[4];
+    C10_CUDA_CHECK(cudaMemcpyAsync(mm, minmax.data_ptr<int32_t>(), sizeof(mm),
+                                   cudaMemcpyDeviceToHost, stream));
+    C10_CUDA_CHECK(cudaStreamSynchronize(stream));
+    const int64_t span_x = static_cast<int64_t>(mm[1]) - mm[0];
+    const int64_t span_y = static_cast<int64_t>(mm[3]) - mm[2];
+    if (span_x < 65536 && span_y < 65536) {
+      min_kx = mm[0];
+      min_ky = mm[2];
+      key_shift = 16;
+    }
+  }
+
   auto keys = torch::empty({n}, opts_i64);
   auto perm = torch::empty({n}, opts_i32);
   k_cell_keys<<<grid(n), kBlk, 0, stream>>>(
-      X.data_ptr<float>(), n, inv_r,
+      X.data_ptr<float>(), n, inv_r, min_kx, min_ky, key_shift,
       reinterpret_cast<uint64_t*>(keys.data_ptr<int64_t>()),
       perm.data_ptr<int32_t>());
 
   // ---------------------------------------------------------------- stage 2
+  // cub radix sort with an explicit bit range: the narrow packing occupies
+  // only the low 32 bits, which halves the radix passes vs a blind 64-bit
+  // sort. Out-of-place, so the sorted buffers replace the originals.
   stage_mark(1);
-  thrust::sort_by_key(
-      policy,
-      thrust::device_pointer_cast(reinterpret_cast<uint64_t*>(keys.data_ptr<int64_t>())),
-      thrust::device_pointer_cast(reinterpret_cast<uint64_t*>(keys.data_ptr<int64_t>())) + n,
-      thrust::device_pointer_cast(perm.data_ptr<int32_t>()));
+  {
+    auto keys_out = torch::empty({n}, opts_i64);
+    auto perm_out = torch::empty({n}, opts_i32);
+    const int end_bit = (key_shift == 16) ? 32 : 64;
+    size_t temp_bytes = 0;
+    C10_CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+        nullptr, temp_bytes,
+        reinterpret_cast<uint64_t*>(keys.data_ptr<int64_t>()),
+        reinterpret_cast<uint64_t*>(keys_out.data_ptr<int64_t>()),
+        perm.data_ptr<int32_t>(), perm_out.data_ptr<int32_t>(), n,
+        /*begin_bit=*/0, end_bit, stream));
+    auto temp = torch::empty({static_cast<int64_t>(temp_bytes)}, opts_u8);
+    C10_CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+        temp.data_ptr<uint8_t>(), temp_bytes,
+        reinterpret_cast<uint64_t*>(keys.data_ptr<int64_t>()),
+        reinterpret_cast<uint64_t*>(keys_out.data_ptr<int64_t>()),
+        perm.data_ptr<int32_t>(), perm_out.data_ptr<int32_t>(), n,
+        /*begin_bit=*/0, end_bit, stream));
+    keys = keys_out;
+    perm = perm_out;
+  }
   if (dbg) { dbg->keys_sorted = keys; dbg->perm = perm; }
 
   auto xs = torch::empty({n}, X.options());
@@ -663,7 +783,7 @@ static torch::Tensor dbscan2d_cuda_impl(torch::Tensor X, double eps,
       static_cast<int32_t>((ngh_threads + kBlk - 1) / kBlk);
   k_build_ngh<<<ngh_blocks, kBlk, 0, stream>>>(
       reinterpret_cast<uint64_t*>(cell_keys.data_ptr<int64_t>()), num_cells,
-      ngh.data_ptr<int32_t>());
+      key_shift, ngh.data_ptr<int32_t>());
 
   // ---------------------------------------------------------------- stage 5
   stage_mark(4);

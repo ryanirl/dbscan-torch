@@ -7,15 +7,21 @@
 //
 // Layout: points are sorted by cell key once, so each cell is a contiguous
 // slice of `xs`, `ys`, `labels`. A 25-entry neighbor-cell table is
-// precomputed per cell, eliminating hashmap traffic from the hot loop.
+// precomputed per cell by a column-pair merge-join over the sorted cells,
+// keeping hashmap and binary-search traffic out of the hot loops.
+//
+// Keys: when a large input's occupied grid spans fewer than 2^16 cells per
+// axis (any realistic dataset), coords pack as 16+16-bit offsets into a
+// 32-bit key sorted by a 2-pass parallel radix sort; otherwise (and for
+// small inputs) 64-bit sign-biased keys are sorted via at::sort.
 //
 // Parallelism: at::parallel_for over the embarrassingly-parallel stages
-// (cell-key compute, reorder, both core-marking passes, cell status, UF
-// unions, core labels, border, unpermute). Cell-level union-find uses
-// std::atomic<int32_t> with lock-free CAS unite + path-halving find.
-// Sorting is delegated to at::sort, which is parallel under torch's existing
-// threading layer -- no extra build deps. The cell-boundary scan and the
-// root-to-cluster id assignment stay sequential (small relative to N).
+// (cell-key compute, reorder, boundary scan, both core-marking passes, cell
+// status, UF unions, core labels, border, unpermute). Cell-level union-find
+// uses std::atomic<int32_t> with lock-free CAS unite + path-halving find.
+// Chunked stages use a fixed chunk grid (independent of thread count), so
+// output is bit-identical under any parallelism. Only the root-to-cluster
+// id assignment stays sequential (small relative to N).
 //
 // Thread count follows torch.get_num_threads() / OMP_NUM_THREADS, like any
 // other torch op.
@@ -120,6 +126,89 @@ struct AtomicUF {
   }
 };
 
+// Stable 2x16-bit LSD radix sort of (key, value) pairs for 32-bit keys.
+// Parallel and deterministic: a fixed chunk grid (independent of thread
+// count), per-chunk histograms, bucket-major prefix, chunk-stable scatter.
+// Two passes of sequential memory traffic, which beats a comparison sort on
+// 64-bit keys by a wide margin at the sizes where it is enabled.
+inline void radix_sort_pairs32(std::vector<uint32_t>& keys,
+                               std::vector<int32_t>& vals) {
+  const int64_t n = static_cast<int64_t>(keys.size());
+  constexpr int64_t kChunks = 64;
+  constexpr int64_t kBuckets = 65536;
+  std::vector<uint32_t> keys_tmp(n);
+  std::vector<int32_t> vals_tmp(n);
+  std::vector<int32_t> hist(kChunks * kBuckets);
+  auto chunk_lo = [&](int64_t chunk) { return n * chunk / kChunks; };
+
+  for (int pass = 0; pass < 2; ++pass) {
+    const int shift = pass * 16;
+
+    at::parallel_for(0, kChunks, 1, [&](int64_t b, int64_t e) {
+      for (int64_t chunk = b; chunk < e; ++chunk) {
+        int32_t* h = hist.data() + chunk * kBuckets;
+        std::fill(h, h + kBuckets, 0);
+        for (int64_t i = chunk_lo(chunk); i < chunk_lo(chunk + 1); ++i) {
+          ++h[(keys[i] >> shift) & 0xFFFF];
+        }
+      }
+    });
+
+    // Per-bucket totals, then rewrite hist in place to per-(chunk, bucket)
+    // starting offsets: bucket-major, chunk-minor, so equal keys keep their
+    // chunk order (stability).
+    std::vector<int64_t> bucket_total(kBuckets);
+    at::parallel_for(0, kBuckets, 1024, [&](int64_t b, int64_t e) {
+      for (int64_t bucket = b; bucket < e; ++bucket) {
+        int64_t total = 0;
+        for (int64_t chunk = 0; chunk < kChunks; ++chunk) {
+          total += hist[chunk * kBuckets + bucket];
+        }
+        bucket_total[bucket] = total;
+      }
+    });
+    int64_t running = 0;
+    std::vector<int64_t> bucket_base(kBuckets);
+    for (int64_t bucket = 0; bucket < kBuckets; ++bucket) {
+      bucket_base[bucket] = running;
+      running += bucket_total[bucket];
+    }
+    at::parallel_for(0, kBuckets, 1024, [&](int64_t b, int64_t e) {
+      for (int64_t bucket = b; bucket < e; ++bucket) {
+        int64_t offset = bucket_base[bucket];
+        for (int64_t chunk = 0; chunk < kChunks; ++chunk) {
+          const int32_t count = hist[chunk * kBuckets + bucket];
+          hist[chunk * kBuckets + bucket] = static_cast<int32_t>(offset - bucket_base[bucket]);
+          offset += count;
+        }
+      }
+    });
+
+    at::parallel_for(0, kChunks, 1, [&](int64_t b, int64_t e) {
+      for (int64_t chunk = b; chunk < e; ++chunk) {
+        int32_t* h = hist.data() + chunk * kBuckets;
+        for (int64_t i = chunk_lo(chunk); i < chunk_lo(chunk + 1); ++i) {
+          const int64_t bucket = (keys[i] >> shift) & 0xFFFF;
+          const int64_t dst = bucket_base[bucket] + h[bucket]++;
+          keys_tmp[dst] = keys[i];
+          vals_tmp[dst] = vals[i];
+        }
+      }
+    });
+
+    keys.swap(keys_tmp);
+    vals.swap(vals_tmp);
+  }
+}
+
+// Core pass 2 visit order: center cell, then ring 1, then ring 2. Nearby
+// cells contribute the most eps-neighbors, so counting them first lets the
+// min_samples early exit fire before the mostly-out-of-range ring-2 scans.
+// The count is commutative, so the order cannot change the outcome.
+static const int32_t kCoreScanOrder[25] = {
+    12, 6, 7,  8,  11, 13, 16, 17, 18, 0,  1,  2, 3,
+    4,  5, 9, 10, 14, 15, 19, 20, 21, 22, 23, 24};
+
 // Squared distance from (x, y) to the box [box[0], box[1]] x [box[2], box[3]]
 // (a per-cell point bounding box); zero when the point is inside. Same
 // subtract-then-square shape as the point-pair distance in the scans, so
@@ -158,26 +247,96 @@ inline Result dbscan2d(const float* xs_in, const float* ys_in, int32_t n,
   const float eps_sq = eps * eps;
 
   // ---------------------------------------------------------------- stage 1
-  // Per-point packed cell key. Cell coords get unpacked from the (sorted) key
-  // at cell boundaries below -- no need to keep separate kxs/kys.
-  std::vector<uint64_t> keys(n);
-  at::parallel_for(0, n, 4096, [&](int64_t b, int64_t e) {
-    for (int64_t i = b; i < e; ++i) {
-      int32_t kx = static_cast<int32_t>(std::floor(xs_in[i] * inv_r));
-      int32_t ky = static_cast<int32_t>(std::floor(ys_in[i] * inv_r));
-      keys[i] = cell_key(kx, ky);
+  // Narrow-key detection: when the occupied grid spans fewer than 2^16
+  // cells per axis (any realistic dataset), keys pack into 32 bits as
+  // offsets from the grid minimum, and stage 2 uses the 2-pass radix sort
+  // instead of at::sort on 64-bit keys. Only checked for large inputs; the
+  // extra pass over the input would not pay below that.
+  constexpr int64_t kNarrowMinN = 1 << 22;
+  bool narrow = false;
+  int32_t min_kx = 0, min_ky = 0;
+  if (n >= kNarrowMinN) {
+    constexpr int64_t kMinMaxChunks = 64;
+    int32_t mins[4 * kMinMaxChunks];  // per-chunk min_kx, max_kx, min_ky, max_ky
+    at::parallel_for(0, kMinMaxChunks, 1, [&](int64_t b, int64_t e) {
+      for (int64_t chunk = b; chunk < e; ++chunk) {
+        int32_t lo_x = INT32_MAX, hi_x = INT32_MIN;
+        int32_t lo_y = INT32_MAX, hi_y = INT32_MIN;
+        for (int64_t i = n * chunk / kMinMaxChunks;
+             i < n * (chunk + 1) / kMinMaxChunks; ++i) {
+          const int32_t kx = static_cast<int32_t>(std::floor(xs_in[i] * inv_r));
+          const int32_t ky = static_cast<int32_t>(std::floor(ys_in[i] * inv_r));
+          lo_x = std::min(lo_x, kx);
+          hi_x = std::max(hi_x, kx);
+          lo_y = std::min(lo_y, ky);
+          hi_y = std::max(hi_y, ky);
+        }
+        mins[4 * chunk + 0] = lo_x;
+        mins[4 * chunk + 1] = hi_x;
+        mins[4 * chunk + 2] = lo_y;
+        mins[4 * chunk + 3] = hi_y;
+      }
+    });
+    int32_t lo_x = INT32_MAX, hi_x = INT32_MIN;
+    int32_t lo_y = INT32_MAX, hi_y = INT32_MIN;
+    for (int64_t chunk = 0; chunk < kMinMaxChunks; ++chunk) {
+      lo_x = std::min(lo_x, mins[4 * chunk + 0]);
+      hi_x = std::max(hi_x, mins[4 * chunk + 1]);
+      lo_y = std::min(lo_y, mins[4 * chunk + 2]);
+      hi_y = std::max(hi_y, mins[4 * chunk + 3]);
     }
-  });
+    const int64_t span_x = static_cast<int64_t>(hi_x) - lo_x;
+    const int64_t span_y = static_cast<int64_t>(hi_y) - lo_y;
+    if (span_x < 65536 && span_y < 65536) {
+      narrow = true;
+      min_kx = lo_x;
+      min_ky = lo_y;
+    }
+  }
+
+  // Per-point packed cell key (width per the detection above). Cell coords
+  // get unpacked from the (sorted) key at cell boundaries below.
+  std::vector<uint64_t> keys64;
+  std::vector<uint32_t> keys32;
+  if (narrow) {
+    keys32.resize(n);
+    at::parallel_for(0, n, 4096, [&](int64_t b, int64_t e) {
+      for (int64_t i = b; i < e; ++i) {
+        const int32_t kx = static_cast<int32_t>(std::floor(xs_in[i] * inv_r));
+        const int32_t ky = static_cast<int32_t>(std::floor(ys_in[i] * inv_r));
+        keys32[i] = (static_cast<uint32_t>(kx - min_kx) << 16) |
+                    static_cast<uint32_t>(ky - min_ky);
+      }
+    });
+  } else {
+    keys64.resize(n);
+    at::parallel_for(0, n, 4096, [&](int64_t b, int64_t e) {
+      for (int64_t i = b; i < e; ++i) {
+        const int32_t kx = static_cast<int32_t>(std::floor(xs_in[i] * inv_r));
+        const int32_t ky = static_cast<int32_t>(std::floor(ys_in[i] * inv_r));
+        keys64[i] = cell_key(kx, ky);
+      }
+    });
+  }
   stage_end(0);
 
   // ---------------------------------------------------------------- stage 2
-  // Sort by key via at::sort. We need BOTH the sorted keys (for the boundary
-  // walk -- sequential reads, no gather) and the argsort permutation (for the
-  // xs/ys reorder).
+  // Sort by key. Narrow path: 2-pass radix on (key32, index), which also
+  // yields the int32 permutation directly. Fallback: at::sort on int64 keys
+  // plus an index-width conversion. Either way we keep BOTH the sorted keys
+  // (for the boundary walk) and the permutation (for the xs/ys reorder).
   std::vector<int32_t> perm(n);
   at::Tensor sorted_keys_t;
-  {
-    auto keys_t = at::from_blob(reinterpret_cast<int64_t*>(keys.data()),
+  const uint64_t* sorted_keys = nullptr;
+  if (narrow) {
+    at::parallel_for(0, n, 4096, [&](int64_t b, int64_t e) {
+      for (int64_t i = b; i < e; ++i) {
+        perm[i] = static_cast<int32_t>(i);
+      }
+    });
+    radix_sort_pairs32(keys32, perm);
+  } else {
+    auto keys_t = at::from_blob(reinterpret_cast<int64_t*>(keys64.data()),
                                 {n}, at::kLong);
     auto sort_result = at::sort(keys_t, /*dim=*/-1, /*descending=*/false);
     sorted_keys_t = std::get<0>(sort_result);
@@ -188,10 +347,10 @@ inline Result dbscan2d(const float* xs_in, const float* ys_in, int32_t n,
         perm[i] = static_cast<int32_t>(p_i64[i]);
       }
     });
+    std::vector<uint64_t>().swap(keys64);  // original-order keys done
+    sorted_keys =
+        reinterpret_cast<const uint64_t*>(sorted_keys_t.data_ptr<int64_t>());
   }
-  std::vector<uint64_t>().swap(keys);  // original-order keys no longer needed
-  const uint64_t* sorted_keys =
-      reinterpret_cast<const uint64_t*>(sorted_keys_t.data_ptr<int64_t>());
 
   // Reorder xs/ys into sort order. Cell coords are rederived from sorted_keys
   // at the boundary walk below, so we don't gather them here.
@@ -209,49 +368,69 @@ inline Result dbscan2d(const float* xs_in, const float* ys_in, int32_t n,
   // Cell boundaries. Deterministic chunked two-pass scan: count boundary
   // flags per fixed chunk, prefix the chunk counts sequentially (tiny),
   // then fill. The chunk grid depends only on n -- never on the thread
-  // count -- so the output is bit-identical under any parallelism.
+  // count -- so the output is bit-identical under any parallelism. Generic
+  // over the two key widths; on the narrow path cell_kx/cell_ky hold the
+  // non-negative OFFSET coords (downstream only ever uses differences and
+  // ordering, and non-negative values keep the column search's unsigned
+  // comparator valid).
   const int64_t num_chunks = std::min<int64_t>(256, std::max<int64_t>(1, n));
   auto chunk_lo = [&](int64_t chunk) {
     return 1 + (static_cast<int64_t>(n) - 1) * chunk / num_chunks;
   };
-  std::vector<int64_t> chunk_offset(num_chunks + 1, 0);
-  at::parallel_for(0, num_chunks, 1, [&](int64_t b, int64_t e) {
-    for (int64_t chunk = b; chunk < e; ++chunk) {
-      int64_t count = 0;
-      for (int64_t i = chunk_lo(chunk); i < chunk_lo(chunk + 1); ++i) {
-        count += (sorted_keys[i] != sorted_keys[i - 1]);
+  int32_t num_cells = 0;
+  std::vector<int32_t> cell_start, cell_kx, cell_ky;
+  auto scan_boundaries = [&](const auto* skeys, auto unpack_fn) {
+    std::vector<int64_t> chunk_offset(num_chunks + 1, 0);
+    at::parallel_for(0, num_chunks, 1, [&](int64_t b, int64_t e) {
+      for (int64_t chunk = b; chunk < e; ++chunk) {
+        int64_t count = 0;
+        for (int64_t i = chunk_lo(chunk); i < chunk_lo(chunk + 1); ++i) {
+          count += (skeys[i] != skeys[i - 1]);
+        }
+        chunk_offset[chunk + 1] = count;
       }
-      chunk_offset[chunk + 1] = count;
+    });
+    for (int64_t chunk = 0; chunk < num_chunks; ++chunk) {
+      chunk_offset[chunk + 1] += chunk_offset[chunk];
     }
-  });
-  for (int64_t chunk = 0; chunk < num_chunks; ++chunk) {
-    chunk_offset[chunk + 1] += chunk_offset[chunk];
-  }
 
-  const int32_t num_cells = static_cast<int32_t>(chunk_offset[num_chunks]) + 1;
-  std::vector<int32_t> cell_start(static_cast<size_t>(num_cells) + 1);
-  std::vector<int32_t> cell_kx(num_cells), cell_ky(num_cells);
-  cell_start[0] = 0;
-  cell_start[num_cells] = n;
-  {
-    auto [kx0, ky0] = unpack_cell_key(sorted_keys[0]);
-    cell_kx[0] = kx0;
-    cell_ky[0] = ky0;
-  }
-  at::parallel_for(0, num_chunks, 1, [&](int64_t b, int64_t e) {
-    for (int64_t chunk = b; chunk < e; ++chunk) {
-      int64_t c = chunk_offset[chunk] + 1;
-      for (int64_t i = chunk_lo(chunk); i < chunk_lo(chunk + 1); ++i) {
-        if (sorted_keys[i] != sorted_keys[i - 1]) {
-          cell_start[c] = static_cast<int32_t>(i);
-          auto [kx, ky] = unpack_cell_key(sorted_keys[i]);
-          cell_kx[c] = kx;
-          cell_ky[c] = ky;
-          ++c;
+    num_cells = static_cast<int32_t>(chunk_offset[num_chunks]) + 1;
+    cell_start.assign(static_cast<size_t>(num_cells) + 1, 0);
+    cell_kx.resize(num_cells);
+    cell_ky.resize(num_cells);
+    cell_start[0] = 0;
+    cell_start[num_cells] = n;
+    {
+      auto [kx0, ky0] = unpack_fn(skeys[0]);
+      cell_kx[0] = kx0;
+      cell_ky[0] = ky0;
+    }
+    at::parallel_for(0, num_chunks, 1, [&](int64_t b, int64_t e) {
+      for (int64_t chunk = b; chunk < e; ++chunk) {
+        int64_t c = chunk_offset[chunk] + 1;
+        for (int64_t i = chunk_lo(chunk); i < chunk_lo(chunk + 1); ++i) {
+          if (skeys[i] != skeys[i - 1]) {
+            cell_start[c] = static_cast<int32_t>(i);
+            auto [kx, ky] = unpack_fn(skeys[i]);
+            cell_kx[c] = kx;
+            cell_ky[c] = ky;
+            ++c;
+          }
         }
       }
-    }
-  });
+    });
+  };
+  if (narrow) {
+    auto unpack32 = [](uint32_t k) {
+      return std::pair<int32_t, int32_t>(static_cast<int32_t>(k >> 16),
+                                         static_cast<int32_t>(k & 0xFFFF));
+    };
+    scan_boundaries(keys32.data(), unpack32);
+    std::vector<uint32_t>().swap(keys32);  // sorted keys no longer needed
+  } else {
+    auto unpack64 = [](uint64_t k) { return unpack_cell_key(k); };
+    scan_boundaries(sorted_keys, unpack64);
+  }
 
   stage_end(2);
 
@@ -374,7 +553,10 @@ inline Result dbscan2d(const float* xs_in, const float* ys_in, int32_t n,
     const float xi = xs[i], yi = ys[i];
     const int32_t* row = ngh.data() + size_t(c) * 25;
     int32_t cnt = 0;
-    for (int32_t off = 0; off < 25; ++off) {
+    // Center cell first, then ring 1, then ring 2 (see kCoreScanOrder): the
+    // min_samples early exit usually fires before the ring-2 scans start.
+    for (int32_t k = 0; k < 25; ++k) {
+      const int32_t off = kCoreScanOrder[k];
       const int32_t nc = row[off];
       if (nc < 0) continue;
       const int32_t s = cell_start[nc], en = cell_start[nc + 1];
