@@ -58,6 +58,11 @@ if sys.platform == "darwin":
         if os.path.isdir(prefix):
             _omp_cxx += [f"-I{prefix}/include"]
             break
+    # torch's bundled c10/util/strong_type.h specializes std::is_arithmetic,
+    # which the libc++ shipped with Xcode 26+ rejects as an error
+    # ([[clang::no_specializations]]). Downgrade that diagnostic so
+    # torch/extension.h compiles; older clangs ignore the unknown -Wno- flag.
+    _omp_cxx += ["-Wno-invalid-specialization"]
 else:
     _omp_cxx = ["-fopenmp"]
     _omp_link = ["-fopenmp"]
