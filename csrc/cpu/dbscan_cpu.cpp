@@ -3,6 +3,9 @@
 
 #include <torch/extension.h>
 
+#include <map>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "dbscan_grid.hpp"
