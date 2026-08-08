@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dbscan-torch"
-version = "0.1.1"
+version = "0.2.0"
 description = "Grid-hashed 2D DBSCAN as a native PyTorch extension (CPU + CUDA)."
 readme = "README.md"
 license = {file = "LICENSE"}

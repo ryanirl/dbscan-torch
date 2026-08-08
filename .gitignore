@@ -1,6 +1,15 @@
 benchmarks/
 .claude/
 
+# Eval-loop caches (datasets, golden labels, run results) -- regenerated locally.
+evals/data/
+evals/golden/
+evals/results/
+# Experiment log: append-only history of agent runs, can grow large.
+evals/experiments.jsonl
+# Per-experiment worktrees (orchestrator-managed).
+.experiments/
+
 # Python
 __pycache__/
 *.py[cod]

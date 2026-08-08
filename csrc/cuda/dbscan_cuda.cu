@@ -136,9 +136,10 @@ __device__ int32_t binsearch_cell(const uint64_t* keys, int32_t num_cells,
 
 __global__ void k_build_ngh(const uint64_t* __restrict__ cell_keys,
                             int32_t num_cells, int32_t* __restrict__ ngh) {
-  int32_t c = blockIdx.x;
-  int32_t off = threadIdx.x;
-  if (c >= num_cells || off >= 25) return;
+  int64_t t = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (t >= static_cast<int64_t>(num_cells) * 25) return;
+  int32_t c = static_cast<int32_t>(t / 25);
+  int32_t off = static_cast<int32_t>(t % 25);
   uint64_t self_key = cell_keys[c];
   int32_t kx = static_cast<int32_t>(static_cast<uint32_t>(self_key >> 32));
   int32_t ky = static_cast<int32_t>(static_cast<uint32_t>(self_key));
@@ -146,6 +147,50 @@ __global__ void k_build_ngh(const uint64_t* __restrict__ cell_keys,
   int32_t dy = (off % 5) - 2;
   uint64_t target = pack_key(kx + dx, ky + dy);
   ngh[c * 25 + off] = binsearch_cell(cell_keys, num_cells, target);
+}
+
+// ============================================================================
+// Stage 3d: per-cell bounding box of the points actually in the cell, packed
+// as float4 [xmin, xmax, ymin, ymax].
+//
+// Used for conservative distance pruning in the dense-data scans below
+// (core pass 2, unite pairs, border assign): if a point (or a whole cell) is
+// provably farther than eps from every point of a neighbor cell, the inner
+// scan over that cell can be skipped without looking at any of its points.
+// Skips only happen when no pair could qualify, so labels are unchanged.
+// ============================================================================
+__global__ void k_cell_bbox(const float* __restrict__ xs,
+                            const float* __restrict__ ys,
+                            const int32_t* __restrict__ cell_start,
+                            int32_t num_cells, float4* __restrict__ bbox) {
+  int32_t c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= num_cells) return;
+  int32_t s = cell_start[c], e = cell_start[c + 1];
+  float xmin = xs[s], xmax = xs[s], ymin = ys[s], ymax = ys[s];
+  for (int32_t i = s + 1; i < e; ++i) {
+    xmin = fminf(xmin, xs[i]);
+    xmax = fmaxf(xmax, xs[i]);
+    ymin = fminf(ymin, ys[i]);
+    ymax = fmaxf(ymax, ys[i]);
+  }
+  bbox[c] = make_float4(xmin, xmax, ymin, ymax);
+}
+
+// Squared distance from (x, y) to the box [b.x, b.y] x [b.z, b.w]; zero when
+// the point is inside. Uses the same subtract-then-square shape as the
+// point-pair distance in the scan kernels, so "box farther than eps" soundly
+// implies every point inside the box is farther than eps.
+__device__ __forceinline__ float point_box_d2(float x, float y, float4 b) {
+  float dx = fmaxf(fmaxf(b.x - x, x - b.y), 0.0f);
+  float dy = fmaxf(fmaxf(b.z - y, y - b.w), 0.0f);
+  return dx * dx + dy * dy;
+}
+
+// Squared distance between two point bounding boxes; zero when they overlap.
+__device__ __forceinline__ float box_box_d2(float4 a, float4 b) {
+  float dx = fmaxf(fmaxf(b.x - a.y, a.x - b.y), 0.0f);
+  float dy = fmaxf(fmaxf(b.z - a.w, a.z - b.w), 0.0f);
+  return dx * dx + dy * dy;
 }
 
 // ============================================================================
@@ -169,7 +214,8 @@ __global__ void k_core_pass2(const float* __restrict__ xs,
                              const float* __restrict__ ys,
                              const int32_t* __restrict__ cell_start,
                              const int32_t* __restrict__ point_cell,
-                             const int32_t* __restrict__ ngh, int32_t n,
+                             const int32_t* __restrict__ ngh,
+                             const float4* __restrict__ bbox, int32_t n,
                              int32_t min_samples, float eps_sq,
                              uint8_t* __restrict__ is_core) {
   int32_t i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -182,11 +228,12 @@ __global__ void k_core_pass2(const float* __restrict__ xs,
   for (int32_t off = 0; off < 25; ++off) {
     int32_t nc = row[off];
     if (nc < 0) continue;
-    int32_t s = cell_start[nc], e = cell_start[nc + 1];
     if (off == 12) {
-      cnt += (e - s);
+      cnt += cell_start[nc + 1] - cell_start[nc];
       if (cnt >= min_samples) break;
     } else {
+      if (point_box_d2(xi, yi, bbox[nc]) > eps_sq) continue;
+      int32_t s = cell_start[nc], e = cell_start[nc + 1];
       for (int32_t j = s; j < e; ++j) {
         float ex = xs[j] - xi, ey = ys[j] - yi;
         if (ex * ex + ey * ey <= eps_sq) ++cnt;
@@ -238,6 +285,19 @@ __device__ __forceinline__ int32_t uf_find(int32_t* uf, int32_t x) {
   return x;
 }
 
+// Read-only walk to root. Used by k_uf_flatten only, where path-halving
+// writes would race: a flatten thread t_c writes uf[c] = root as its final
+// assignment, while a concurrent flatten thread t_d (with c on d's path)
+// can write uf[c] = some_ancestor as path halving inside its find. If t_d's
+// write lands after t_c's assignment, uf[c] ends up pointing to a non-root,
+// which silently corrupts cluster_id_per_cell. Read-only find sidesteps the
+// race: each flatten thread writes only its own uf[c] slot.
+__device__ __forceinline__ int32_t uf_find_readonly(const int32_t* uf,
+                                                    int32_t x) {
+  while (uf[x] != x) x = uf[x];
+  return x;
+}
+
 __device__ __forceinline__ void uf_unite(int32_t* uf, int32_t a, int32_t b) {
   while (true) {
     a = uf_find(uf, a);
@@ -261,6 +321,7 @@ __global__ void k_unite_pairs(const float* __restrict__ xs,
                               const uint8_t* __restrict__ is_core,
                               const uint8_t* __restrict__ cell_status,
                               const int32_t* __restrict__ ngh,
+                              const float4* __restrict__ bbox,
                               int32_t num_cells, float eps_sq,
                               int32_t* __restrict__ uf) {
   int32_t c = blockIdx.x;
@@ -271,12 +332,31 @@ __global__ void k_unite_pairs(const float* __restrict__ xs,
   if (nc <= c) return;  // each undirected pair processed once (lower -> higher)
   if (cell_status[nc] == 0) return;
 
+  // If c and nc are already in the same component (via transitive unions by
+  // other threads), the inner pair scan is redundant work. Read-only walk:
+  // no writes here means no race with other threads' path-halving. A stale
+  // view of uf[] can only show *fewer* merges than reality -- never more --
+  // so if we conclude "already united" we are correct; if we conclude "not
+  // united" we just do the scan, which is the same as before.
+  if (uf_find_readonly(uf, c) == uf_find_readonly(uf, nc)) return;
+
+  // Dense-cell pruning. Ring-2 neighbor offsets sit at a geometric gap of up
+  // to exactly eps, so a dense cell pair there rarely holds an eps-close pair
+  // -- yet without a prune the scan below runs the full O(|c| * |nc|) pass in
+  // ONE thread (the 22s-on-blobs-at-10M catastrophe). The box-box check
+  // rejects such pairs outright; the per-point check inside the outer loop
+  // caps a fruitless scan at O(|c|). Both are conservative: they skip only
+  // when no point pair could be within eps, so the partition is unchanged.
+  float4 bb_n = bbox[nc];
+  if (box_box_d2(bbox[c], bb_n) > eps_sq) return;
+
   int32_t s_c = cell_start[c], e_c = cell_start[c + 1];
   int32_t s_n = cell_start[nc], e_n = cell_start[nc + 1];
   bool found = false;
   for (int32_t i = s_c; i < e_c && !found; ++i) {
     if (!is_core[i]) continue;
     float xi = xs[i], yi = ys[i];
+    if (point_box_d2(xi, yi, bb_n) > eps_sq) continue;
     for (int32_t j = s_n; j < e_n; ++j) {
       if (!is_core[j]) continue;
       float ex = xs[j] - xi, ey = ys[j] - yi;
@@ -289,11 +369,12 @@ __global__ void k_unite_pairs(const float* __restrict__ xs,
   if (found) uf_unite(uf, c, nc);
 }
 
-// Final compaction so uf[c] points directly to its root.
+// Final compaction so uf[c] points directly to its root. Uses
+// uf_find_readonly: see its comment for why path-halving find would race.
 __global__ void k_uf_flatten(int32_t* uf, int32_t num_cells) {
   int32_t c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= num_cells) return;
-  uf[c] = uf_find(uf, c);
+  uf[c] = uf_find_readonly(uf, c);
 }
 
 // ============================================================================
@@ -350,6 +431,7 @@ __global__ void k_border_assign(
     const int32_t* __restrict__ point_cell,
     const int32_t* __restrict__ ngh,
     const uint8_t* __restrict__ cell_status,
+    const float4* __restrict__ bbox,
     const int32_t* __restrict__ perm,
     const int32_t* __restrict__ sorted_labels_in, int32_t n, float eps_sq,
     int32_t* __restrict__ sorted_labels_out) {
@@ -368,6 +450,7 @@ __global__ void k_border_assign(
   for (int32_t off = 0; off < 25; ++off) {
     int32_t nc = row[off];
     if (nc < 0 || cell_status[nc] == 0) continue;
+    if (point_box_d2(xi, yi, bbox[nc]) > eps_sq) continue;
     int32_t s = cell_start[nc], e = cell_start[nc + 1];
     for (int32_t j = s; j < e; ++j) {
       if (!is_core[j]) continue;
@@ -397,9 +480,58 @@ __global__ void k_unpermute(const int32_t* __restrict__ perm,
   labels[perm[i]] = sorted_labels[i];
 }
 
+// Per-stage tensor handles captured by the debug entrypoint. Production
+// passes nullptr; the per-stage capture is one predictable branch per
+// pipeline (zero measurable perf cost), and a tensor assignment is a
+// shared_ptr ref bump, not a copy.
+struct DebugIntermediates {
+  torch::Tensor keys_sorted;
+  torch::Tensor perm;
+  torch::Tensor xs;
+  torch::Tensor ys;
+  torch::Tensor is_core;
+  torch::Tensor cell_start;
+  torch::Tensor cluster_id_per_cell;
+  torch::Tensor uf;
+  torch::Tensor sorted_labels_pre_border;
+  torch::Tensor sorted_labels_final;
+};
+
+// Per-stage GPU-time attribution. Stage boundaries match the production
+// pipeline's comment blocks (10 stages). Filled by the impl only when a
+// non-null pointer is passed; production path skips event creation entirely.
+//
+// Caveat: cudaEventElapsedTime captures GPU execution time only. The host
+// sync inside the boundary scan (cudaMemcpyAsync + cudaStreamSynchronize to
+// read num_cells) shows up as a wallclock cost but NOT in stage_3's GPU
+// time. The gap between sum(stage_ms) and total wallclock measures that
+// host overhead -- itself a useful attribution signal.
+struct StageTimings {
+  static constexpr int N = 10;
+  float ms[N] = {0};
+};
+static const char* const kStageNames[StageTimings::N] = {
+    "cell_keys",       // stage 1: cell-key computation
+    "sort_gather",     // stage 2: sort_by_key + gather xs/ys
+    "boundary_scan",   // stage 3: flag + inclusive_scan + extract cell_start
+    "build_ngh",       // stage 4: 5x5 neighbor table via binary search
+    "core_mark",       // stage 5: pass1 + pass2 + cell_status
+    "union_find",      // stage 6: uf_init + unite_pairs + flatten
+    "cluster_id",      // stage 7: root_flag + exclusive_scan + cluster_id
+    "core_labels",     // stage 8: core-point labels in sort order
+    "border_assign",   // stage 9: nearest-core border assignment
+    "unpermute",       // stage 10: sort order -> input order
+};
+
 }  // namespace
 
-torch::Tensor dbscan2d_cuda(torch::Tensor X, double eps, int64_t min_samples) {
+// Shared host pipeline. ``dbg`` and ``timings`` are null on the production
+// path -- the per-stage captures collapse to single predictable branches
+// with no allocation, no event creation. Pass non-null when you want them.
+static torch::Tensor dbscan2d_cuda_impl(torch::Tensor X, double eps,
+                                        int64_t min_samples,
+                                        DebugIntermediates* dbg,
+                                        StageTimings* timings) {
   TORCH_CHECK(X.is_cuda(), "X must be on CUDA");
   TORCH_CHECK(X.scalar_type() == torch::kFloat32, "X must be float32");
   TORCH_CHECK(X.dim() == 2 && X.size(1) == 2, "X must be (N, 2)");
@@ -423,7 +555,21 @@ torch::Tensor dbscan2d_cuda(torch::Tensor X, double eps, int64_t min_samples) {
   constexpr int kBlk = 256;
   auto grid = [](int32_t total) { return (total + kBlk - 1) / kBlk; };
 
+  // Stage-boundary events: evs[i] is the *start* of stage (i+1); evs[N]
+  // is the end of stage N. elapsed_time(evs[i], evs[i+1]) gives stage i+1
+  // GPU time. Only created when ``timings`` was requested.
+  cudaEvent_t evs[StageTimings::N + 1] = {nullptr};
+  if (timings) {
+    for (int i = 0; i <= StageTimings::N; ++i) {
+      C10_CUDA_CHECK(cudaEventCreate(&evs[i]));
+    }
+  }
+  auto stage_mark = [&](int i) {
+    if (timings) C10_CUDA_CHECK(cudaEventRecord(evs[i], stream));
+  };
+
   // ---------------------------------------------------------------- stage 1
+  stage_mark(0);
   auto keys = torch::empty({n}, opts_i64);
   auto perm = torch::empty({n}, opts_i32);
   k_cell_keys<<<grid(n), kBlk, 0, stream>>>(
@@ -432,11 +578,13 @@ torch::Tensor dbscan2d_cuda(torch::Tensor X, double eps, int64_t min_samples) {
       perm.data_ptr<int32_t>());
 
   // ---------------------------------------------------------------- stage 2
+  stage_mark(1);
   thrust::sort_by_key(
       policy,
       thrust::device_pointer_cast(reinterpret_cast<uint64_t*>(keys.data_ptr<int64_t>())),
       thrust::device_pointer_cast(reinterpret_cast<uint64_t*>(keys.data_ptr<int64_t>())) + n,
       thrust::device_pointer_cast(perm.data_ptr<int32_t>()));
+  if (dbg) { dbg->keys_sorted = keys; dbg->perm = perm; }
 
   auto xs = torch::empty({n}, X.options());
   auto ys = torch::empty({n}, X.options());
@@ -444,8 +592,10 @@ torch::Tensor dbscan2d_cuda(torch::Tensor X, double eps, int64_t min_samples) {
                                             perm.data_ptr<int32_t>(), n,
                                             xs.data_ptr<float>(),
                                             ys.data_ptr<float>());
+  if (dbg) { dbg->xs = xs; dbg->ys = ys; }
 
   // ---------------------------------------------------------------- stage 3
+  stage_mark(2);
   auto flag = torch::empty({n}, opts_i32);
   auto flag_scan = torch::empty({n}, opts_i32);
 
@@ -477,16 +627,31 @@ torch::Tensor dbscan2d_cuda(torch::Tensor X, double eps, int64_t min_samples) {
       reinterpret_cast<uint64_t*>(keys.data_ptr<int64_t>()), n, num_cells,
       cell_start.data_ptr<int32_t>(),
       reinterpret_cast<uint64_t*>(cell_keys.data_ptr<int64_t>()));
+  if (dbg) { dbg->cell_start = cell_start; }
+
+  // Per-cell point bounding boxes for the conservative distance prunes in
+  // core pass 2, unite pairs, and border assign.
+  auto bbox = torch::empty({num_cells, 4}, X.options());
+  k_cell_bbox<<<grid(num_cells), kBlk, 0, stream>>>(
+      xs.data_ptr<float>(), ys.data_ptr<float>(),
+      cell_start.data_ptr<int32_t>(), num_cells,
+      reinterpret_cast<float4*>(bbox.data_ptr<float>()));
 
   // ---------------------------------------------------------------- stage 4
+  stage_mark(3);
   auto ngh = torch::empty({num_cells, 25}, opts_i32);
-  // 25 threads/block, num_cells blocks. Low occupancy per block, but each
-  // binary search is short and the table is built once.
-  k_build_ngh<<<num_cells, 32, 0, stream>>>(
+  // Flat thread-per-(cell, offset) mapping: full blocks, unlike the previous
+  // one-block-per-cell launch that idled 7 of 32 threads and paid a block
+  // dispatch per cell (the top stage on uniform data, where cells are many).
+  const int64_t ngh_threads = static_cast<int64_t>(num_cells) * 25;
+  const int32_t ngh_blocks =
+      static_cast<int32_t>((ngh_threads + kBlk - 1) / kBlk);
+  k_build_ngh<<<ngh_blocks, kBlk, 0, stream>>>(
       reinterpret_cast<uint64_t*>(cell_keys.data_ptr<int64_t>()), num_cells,
       ngh.data_ptr<int32_t>());
 
   // ---------------------------------------------------------------- stage 5
+  stage_mark(4);
   auto is_core = torch::zeros({n}, opts_u8);
   k_core_pass1<<<grid(num_cells), kBlk, 0, stream>>>(
       cell_start.data_ptr<int32_t>(), num_cells, ms,
@@ -495,7 +660,10 @@ torch::Tensor dbscan2d_cuda(torch::Tensor X, double eps, int64_t min_samples) {
   k_core_pass2<<<grid(n), kBlk, 0, stream>>>(
       xs.data_ptr<float>(), ys.data_ptr<float>(),
       cell_start.data_ptr<int32_t>(), point_cell.data_ptr<int32_t>(),
-      ngh.data_ptr<int32_t>(), n, ms, eps_sq, is_core.data_ptr<uint8_t>());
+      ngh.data_ptr<int32_t>(),
+      reinterpret_cast<const float4*>(bbox.data_ptr<float>()), n, ms, eps_sq,
+      is_core.data_ptr<uint8_t>());
+  if (dbg) { dbg->is_core = is_core; }
 
   auto cell_status = torch::empty({num_cells}, opts_u8);
   k_cell_status<<<grid(num_cells), kBlk, 0, stream>>>(
@@ -503,6 +671,7 @@ torch::Tensor dbscan2d_cuda(torch::Tensor X, double eps, int64_t min_samples) {
       cell_status.data_ptr<uint8_t>());
 
   // ---------------------------------------------------------------- stage 6
+  stage_mark(5);
   auto uf = torch::empty({num_cells}, opts_i32);
   k_uf_init<<<grid(num_cells), kBlk, 0, stream>>>(uf.data_ptr<int32_t>(),
                                                   num_cells);
@@ -510,13 +679,16 @@ torch::Tensor dbscan2d_cuda(torch::Tensor X, double eps, int64_t min_samples) {
   k_unite_pairs<<<num_cells, 32, 0, stream>>>(
       xs.data_ptr<float>(), ys.data_ptr<float>(),
       cell_start.data_ptr<int32_t>(), is_core.data_ptr<uint8_t>(),
-      cell_status.data_ptr<uint8_t>(), ngh.data_ptr<int32_t>(), num_cells,
+      cell_status.data_ptr<uint8_t>(), ngh.data_ptr<int32_t>(),
+      reinterpret_cast<const float4*>(bbox.data_ptr<float>()), num_cells,
       eps_sq, uf.data_ptr<int32_t>());
 
   k_uf_flatten<<<grid(num_cells), kBlk, 0, stream>>>(uf.data_ptr<int32_t>(),
                                                      num_cells);
+  if (dbg) { dbg->uf = uf; }
 
   // ---------------------------------------------------------------- stage 7
+  stage_mark(6);
   auto root_flag = torch::empty({num_cells}, opts_i32);
   auto root_id_scan = torch::empty({num_cells}, opts_i32);
   k_root_flag<<<grid(num_cells), kBlk, 0, stream>>>(
@@ -533,28 +705,96 @@ torch::Tensor dbscan2d_cuda(torch::Tensor X, double eps, int64_t min_samples) {
       uf.data_ptr<int32_t>(), cell_status.data_ptr<uint8_t>(),
       root_id_scan.data_ptr<int32_t>(), num_cells,
       cluster_id.data_ptr<int32_t>());
+  if (dbg) { dbg->cluster_id_per_cell = cluster_id; }
 
   // ---------------------------------------------------------------- stage 8
+  stage_mark(7);
   auto sorted_labels = torch::empty({n}, opts_i32);
   k_core_labels<<<grid(n), kBlk, 0, stream>>>(
       is_core.data_ptr<uint8_t>(), point_cell.data_ptr<int32_t>(),
       cluster_id.data_ptr<int32_t>(), n, sorted_labels.data_ptr<int32_t>());
+  if (dbg) { dbg->sorted_labels_pre_border = sorted_labels; }
 
   // ---------------------------------------------------------------- stage 9
+  stage_mark(8);
   auto sorted_labels_final = torch::empty({n}, opts_i32);
   k_border_assign<<<grid(n), kBlk, 0, stream>>>(
       xs.data_ptr<float>(), ys.data_ptr<float>(), is_core.data_ptr<uint8_t>(),
       cell_start.data_ptr<int32_t>(), point_cell.data_ptr<int32_t>(),
       ngh.data_ptr<int32_t>(), cell_status.data_ptr<uint8_t>(),
+      reinterpret_cast<const float4*>(bbox.data_ptr<float>()),
       perm.data_ptr<int32_t>(), sorted_labels.data_ptr<int32_t>(), n, eps_sq,
       sorted_labels_final.data_ptr<int32_t>());
+  if (dbg) { dbg->sorted_labels_final = sorted_labels_final; }
 
   // ---------------------------------------------------------------- stage 10
+  stage_mark(9);
   auto labels = torch::full({n}, kNoise, opts_i32);
   k_unpermute<<<grid(n), kBlk, 0, stream>>>(
       perm.data_ptr<int32_t>(), sorted_labels_final.data_ptr<int32_t>(), n,
       labels.data_ptr<int32_t>());
+  stage_mark(10);
 
   C10_CUDA_CHECK(cudaGetLastError());
+
+  if (timings) {
+    C10_CUDA_CHECK(cudaStreamSynchronize(stream));
+    for (int i = 0; i < StageTimings::N; ++i) {
+      C10_CUDA_CHECK(cudaEventElapsedTime(&timings->ms[i], evs[i], evs[i + 1]));
+    }
+    for (int i = 0; i <= StageTimings::N; ++i) {
+      C10_CUDA_CHECK(cudaEventDestroy(evs[i]));
+    }
+  }
   return labels;
+}
+
+torch::Tensor dbscan2d_cuda(torch::Tensor X, double eps, int64_t min_samples) {
+  return dbscan2d_cuda_impl(std::move(X), eps, min_samples,
+                            /*dbg=*/nullptr, /*timings=*/nullptr);
+}
+
+// Profile entrypoint: runs the production pipeline, returns labels plus a
+// per-stage GPU-time map. Used by the eval loop's --profile mode for
+// attribution-driven optimization. Stage names match kStageNames.
+std::pair<torch::Tensor, std::map<std::string, float>>
+dbscan2d_cuda_profile(torch::Tensor X, double eps, int64_t min_samples) {
+  StageTimings timings;
+  auto labels = dbscan2d_cuda_impl(std::move(X), eps, min_samples,
+                                   /*dbg=*/nullptr, &timings);
+  std::map<std::string, float> out;
+  for (int i = 0; i < StageTimings::N; ++i) {
+    out[kStageNames[i]] = timings.ms[i];
+  }
+  return {labels, out};
+}
+
+// ============================================================================
+// Debug entrypoint: runs the same pipeline as ``dbscan2d_cuda`` and returns
+// the per-stage intermediate tensors so a Python script can diff two runs
+// and find the first divergent stage. Not part of the public API.
+//
+// Return order (also documented in evals/investigate_determinism.py):
+//   0  labels                  (n,)        int32   final output
+//   1  keys_sorted             (n,)        int64   uint64-packed cell keys (sorted)
+//   2  perm                    (n,)        int32   sort permutation (sorted -> original)
+//   3  xs                      (n,)        float32 x-coords in sorted order
+//   4  ys                      (n,)        float32 y-coords in sorted order
+//   5  is_core                 (n,)        uint8   core flag in sorted order
+//   6  cell_start              (num_cells+1,) int32
+//   7  cluster_id_per_cell     (num_cells,)   int32
+//   8  uf                      (num_cells,)   int32   path-compressed roots
+//   9  sorted_labels_pre_bord  (n,)        int32   core labels, before border-assign
+//   10 sorted_labels_final     (n,)        int32   after border-assign, before unpermute
+// ============================================================================
+std::vector<torch::Tensor> dbscan2d_cuda_debug(torch::Tensor X, double eps,
+                                               int64_t min_samples) {
+  TORCH_CHECK(X.dim() == 2 && X.size(0) > 0, "debug variant requires n > 0");
+  DebugIntermediates dbg;
+  auto labels = dbscan2d_cuda_impl(std::move(X), eps, min_samples, &dbg,
+                                   /*timings=*/nullptr);
+  return {labels,           dbg.keys_sorted,         dbg.perm,
+          dbg.xs,           dbg.ys,                  dbg.is_core,
+          dbg.cell_start,   dbg.cluster_id_per_cell, dbg.uf,
+          dbg.sorted_labels_pre_border,              dbg.sorted_labels_final};
 }

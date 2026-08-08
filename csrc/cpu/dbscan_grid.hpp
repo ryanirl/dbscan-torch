@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <numeric>
@@ -52,6 +53,28 @@ inline std::pair<int32_t, int32_t> unpack_cell_key(uint64_t k) {
 struct Result {
   std::vector<int32_t> labels;  // -1 = noise, otherwise [0, n_clusters)
   int32_t n_clusters = 0;
+};
+
+// Per-stage wallclock attribution. Stage names mirror the CUDA path's
+// kStageNames so cross-device profiles are directly comparable. Filled
+// only when ``dbscan2d`` is called with a non-null pointer; production
+// passes nullptr and the per-stage capture compiles down to a single
+// predictable branch (no clock reads, no allocation).
+struct Timings {
+  static constexpr int N = 10;
+  double ms[N] = {0};
+};
+static const char* const kStageNames[Timings::N] = {
+    "cell_keys",       // stage 1
+    "sort_gather",     // stage 2
+    "boundary_scan",   // stage 3
+    "build_ngh",       // stage 4
+    "core_mark",       // stage 5
+    "union_find",      // stage 6
+    "cluster_id",      // stage 7
+    "core_labels",     // stage 8
+    "border_assign",   // stage 9
+    "unpermute",       // stage 10
 };
 
 // Lock-free atomic union-find (ECL-CC pattern). find() does path halving,
@@ -93,15 +116,44 @@ struct AtomicUF {
   }
 };
 
+// Squared distance from (x, y) to the box [box[0], box[1]] x [box[2], box[3]]
+// (a per-cell point bounding box); zero when the point is inside. Same
+// subtract-then-square shape as the point-pair distance in the scans, so
+// "box farther than eps" soundly implies every point inside is farther too.
+inline float point_box_d2(float x, float y, const float* box) {
+  const float dx = std::max({box[0] - x, x - box[1], 0.0f});
+  const float dy = std::max({box[2] - y, y - box[3], 0.0f});
+  return dx * dx + dy * dy;
+}
+
+// Squared distance between two point bounding boxes; zero when they overlap.
+inline float box_box_d2(const float* a, const float* b) {
+  const float dx = std::max({b[0] - a[1], a[0] - b[1], 0.0f});
+  const float dy = std::max({b[2] - a[3], a[2] - b[3], 0.0f});
+  return dx * dx + dy * dy;
+}
+
 inline Result dbscan2d(const float* xs_in, const float* ys_in, int32_t n,
-                       float eps, int32_t min_samples) {
+                       float eps, int32_t min_samples,
+                       Timings* timings = nullptr) {
   Result out;
   out.labels.assign(static_cast<size_t>(n), kNoise);
   if (n == 0 || min_samples < 1) return out;
 
+  using clock = std::chrono::steady_clock;
+  auto stage_t0 = clock::now();
+  auto stage_end = [&](int i) {
+    if (timings) {
+      auto t1 = clock::now();
+      timings->ms[i] = std::chrono::duration<double, std::milli>(t1 - stage_t0).count();
+      stage_t0 = t1;
+    }
+  };
+
   const float inv_r = static_cast<float>(std::sqrt(2.0)) / eps;
   const float eps_sq = eps * eps;
 
+  // ---------------------------------------------------------------- stage 1
   // Per-point packed cell key. Cell coords get unpacked from the (sorted) key
   // at cell boundaries below -- no need to keep separate kxs/kys.
   std::vector<uint64_t> keys(n);
@@ -112,7 +164,9 @@ inline Result dbscan2d(const float* xs_in, const float* ys_in, int32_t n,
       keys[i] = cell_key(kx, ky);
     }
   });
+  stage_end(0);
 
+  // ---------------------------------------------------------------- stage 2
   // Sort by key via at::sort. We need BOTH the sorted keys (for the boundary
   // walk -- sequential reads, no gather) and the argsort permutation (for the
   // xs/ys reorder).
@@ -145,7 +199,9 @@ inline Result dbscan2d(const float* xs_in, const float* ys_in, int32_t n,
       ys[i] = ys_in[p];
     }
   });
+  stage_end(1);
 
+  // ---------------------------------------------------------------- stage 3
   // Cell boundaries -- sequential walk over sorted_keys (cache-friendly).
   std::vector<int32_t> cell_start;
   std::vector<int32_t> cell_kx, cell_ky;
@@ -176,7 +232,9 @@ inline Result dbscan2d(const float* xs_in, const float* ys_in, int32_t n,
   for (int32_t c = 0; c < num_cells; ++c) {
     cell_lookup.emplace(cell_key(cell_kx[c], cell_ky[c]), c);
   }
+  stage_end(2);
 
+  // ---------------------------------------------------------------- stage 4
   // 5x5 neighbor table per cell. Parallel.
   std::vector<int32_t> ngh(static_cast<size_t>(num_cells) * 25, -1);
   at::parallel_for(0, num_cells, 256, [&](int64_t b, int64_t e) {
@@ -193,7 +251,9 @@ inline Result dbscan2d(const float* xs_in, const float* ys_in, int32_t n,
     }
   });
   std::unordered_map<uint64_t, int32_t>().swap(cell_lookup);
+  stage_end(3);
 
+  // ---------------------------------------------------------------- stage 5
   // Per-(sorted-)point cell index. Parallel via cell ranges.
   std::vector<int32_t> point_cell(n);
   at::parallel_for(0, num_cells, 64, [&](int64_t b, int64_t e) {
@@ -259,6 +319,34 @@ inline Result dbscan2d(const float* xs_in, const float* ys_in, int32_t n,
       cell_status[c] = !any ? 0 : (all ? 2 : 1);
     }
   });
+  stage_end(4);
+
+  // ---------------------------------------------------------------- stage 6
+  // Per-cell point bounding boxes, [xmin, xmax, ymin, ymax] per cell. Used
+  // below for conservative pruning: ring-2 neighbor offsets sit at a
+  // geometric gap of up to exactly eps, so a dense cell pair there rarely
+  // holds an eps-close pair, yet without a prune the scan runs the full
+  // O(|c| * |nc|) pass. The box-box check rejects such pairs outright; the
+  // per-point check caps a fruitless scan at O(|c|). Both skip only when no
+  // point pair could be within eps, so the partition is unchanged.
+  std::vector<float> cell_bbox(static_cast<size_t>(num_cells) * 4);
+  at::parallel_for(0, num_cells, 256, [&](int64_t b, int64_t e) {
+    for (int64_t c = b; c < e; ++c) {
+      const int32_t s = cell_start[c], en = cell_start[c + 1];
+      float xmin = xs[s], xmax = xs[s], ymin = ys[s], ymax = ys[s];
+      for (int32_t i = s + 1; i < en; ++i) {
+        xmin = std::min(xmin, xs[i]);
+        xmax = std::max(xmax, xs[i]);
+        ymin = std::min(ymin, ys[i]);
+        ymax = std::max(ymax, ys[i]);
+      }
+      float* box = cell_bbox.data() + size_t(c) * 4;
+      box[0] = xmin;
+      box[1] = xmax;
+      box[2] = ymin;
+      box[3] = ymax;
+    }
+  });
 
   // Cell-level union-find. Atomic-CAS unite. Parallel over cells.
   // OpenMP dynamic schedule: per-cell work varies (cell point counts +
@@ -268,6 +356,7 @@ inline Result dbscan2d(const float* xs_in, const float* ys_in, int32_t n,
   for (int64_t c = 0; c < num_cells; ++c) {
     if (cell_status[c] == 0) continue;
     const int32_t* row = ngh.data() + size_t(c) * 25;
+    const float* bb_c = cell_bbox.data() + size_t(c) * 4;
     const int32_t s_c = cell_start[c], e_c = cell_start[c + 1];
     for (int32_t off = 0; off < 25; ++off) {
       if (off == 12) continue;
@@ -275,12 +364,15 @@ inline Result dbscan2d(const float* xs_in, const float* ys_in, int32_t n,
       if (nc <= static_cast<int32_t>(c)) continue;
       if (cell_status[nc] == 0) continue;
       if (uf.find(static_cast<int32_t>(c)) == uf.find(nc)) continue;
+      const float* bb_n = cell_bbox.data() + size_t(nc) * 4;
+      if (box_box_d2(bb_c, bb_n) > eps_sq) continue;
 
       const int32_t s_n = cell_start[nc], e_n = cell_start[nc + 1];
       bool found = false;
       for (int32_t i = s_c; i < e_c && !found; ++i) {
         if (!is_core[i]) continue;
         const float xi = xs[i], yi = ys[i];
+        if (point_box_d2(xi, yi, bb_n) > eps_sq) continue;
         for (int32_t j = s_n; j < e_n; ++j) {
           if (!is_core[j]) continue;
           const float ex = xs[j] - xi, ey = ys[j] - yi;
@@ -293,7 +385,9 @@ inline Result dbscan2d(const float* xs_in, const float* ys_in, int32_t n,
       if (found) uf.unite(static_cast<int32_t>(c), nc);
     }
   }
+  stage_end(5);
 
+  // ---------------------------------------------------------------- stage 7
   // Renumber roots to dense cluster ids in cell order. Sequential.
   std::vector<int32_t> root_to_cluster(num_cells, kNoise);
   int32_t cid = 0;
@@ -302,7 +396,9 @@ inline Result dbscan2d(const float* xs_in, const float* ys_in, int32_t n,
     const int32_t r = uf.find(c);
     if (root_to_cluster[r] == kNoise) root_to_cluster[r] = cid++;
   }
+  stage_end(6);
 
+  // ---------------------------------------------------------------- stage 8
   // Assign cluster id to each core point. Parallel over cells.
   std::vector<int32_t> sorted_labels(n, kNoise);
   at::parallel_for(0, num_cells, 256, [&](int64_t b, int64_t e) {
@@ -314,7 +410,9 @@ inline Result dbscan2d(const float* xs_in, const float* ys_in, int32_t n,
       }
     }
   });
+  stage_end(7);
 
+  // ---------------------------------------------------------------- stage 9
   // Border assignment: each non-core within eps of some core takes the
   // cluster of the nearest such core, otherwise it stays noise. Parallel
   // over points.
@@ -329,6 +427,8 @@ inline Result dbscan2d(const float* xs_in, const float* ys_in, int32_t n,
       for (int32_t off = 0; off < 25; ++off) {
         const int32_t nc = row[off];
         if (nc < 0 || cell_status[nc] == 0) continue;
+        if (point_box_d2(xi, yi, cell_bbox.data() + size_t(nc) * 4) > eps_sq)
+          continue;
         const int32_t s = cell_start[nc], en = cell_start[nc + 1];
         for (int32_t j = s; j < en; ++j) {
           if (!is_core[j]) continue;
@@ -343,13 +443,16 @@ inline Result dbscan2d(const float* xs_in, const float* ys_in, int32_t n,
       sorted_labels[i] = best_lab;
     }
   });
+  stage_end(8);
 
+  // ---------------------------------------------------------------- stage 10
   // Unpermute back to input order. Parallel.
   at::parallel_for(0, n, 4096, [&](int64_t b, int64_t e) {
     for (int64_t i = b; i < e; ++i) {
       out.labels[perm[i]] = sorted_labels[i];
     }
   });
+  stage_end(9);
   out.n_clusters = cid;
   return out;
 }

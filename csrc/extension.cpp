@@ -7,10 +7,20 @@
 
 #include <torch/extension.h>
 
+#include <map>
+#include <string>
+#include <utility>
+
 torch::Tensor dbscan2d_cpu(torch::Tensor X, double eps, int64_t min_samples);
+std::pair<torch::Tensor, std::map<std::string, float>>
+dbscan2d_cpu_profile(torch::Tensor X, double eps, int64_t min_samples);
 
 #ifdef WITH_CUDA
 torch::Tensor dbscan2d_cuda(torch::Tensor X, double eps, int64_t min_samples);
+std::vector<torch::Tensor> dbscan2d_cuda_debug(torch::Tensor X, double eps,
+                                               int64_t min_samples);
+std::pair<torch::Tensor, std::map<std::string, float>>
+dbscan2d_cuda_profile(torch::Tensor X, double eps, int64_t min_samples);
 #endif
 
 static void check_input(const torch::Tensor& X, double eps, int64_t min_samples) {
@@ -34,10 +44,38 @@ torch::Tensor dbscan2d(torch::Tensor X, double eps, int64_t min_samples) {
   return dbscan2d_cpu(X.contiguous(), eps, min_samples);
 }
 
+// Per-stage attribution: same output as dbscan2d plus a stage-name -> ms map.
+// CUDA values are GPU-only (cudaEventElapsedTime). CPU values are wallclock
+// per stage. The host-sync inside the CUDA boundary scan does not appear in
+// stage_3's GPU time -- compare sum(stages) to total wallclock to see the
+// host overhead.
+std::pair<torch::Tensor, std::map<std::string, float>>
+dbscan2d_profile(torch::Tensor X, double eps, int64_t min_samples) {
+  check_input(X, eps, min_samples);
+  if (X.is_cuda()) {
+#ifdef WITH_CUDA
+    return dbscan2d_cuda_profile(X.contiguous(), eps, min_samples);
+#else
+    TORCH_CHECK(false, "dbscan_torch was built without CUDA support.");
+#endif
+  }
+  return dbscan2d_cpu_profile(X.contiguous(), eps, min_samples);
+}
+
 PYBIND11_MODULE(_C, m) {
   m.doc() = "Native PyTorch DBSCAN (2D, grid-hashed).";
   m.def("dbscan2d", &dbscan2d, pybind11::arg("X"), pybind11::arg("eps"),
         pybind11::arg("min_samples"),
         "Run DBSCAN on (N, 2) float32 tensor. Returns int32 labels "
         "(-1 = noise). Dispatches to CPU or CUDA based on X.device.");
+  m.def("dbscan2d_profile", &dbscan2d_profile, pybind11::arg("X"),
+        pybind11::arg("eps"), pybind11::arg("min_samples"),
+        "Profile variant: returns (labels, {stage_name: ms}). CUDA times are "
+        "GPU-only; CPU times are wallclock per stage. Used by --profile.");
+#ifdef WITH_CUDA
+  m.def("dbscan2d_cuda_debug", &dbscan2d_cuda_debug, pybind11::arg("X"),
+        pybind11::arg("eps"), pybind11::arg("min_samples"),
+        "Debug variant: returns a list of per-stage intermediate tensors. "
+        "See dbscan_cuda.cu for the return layout. Not part of the public API.");
+#endif
 }

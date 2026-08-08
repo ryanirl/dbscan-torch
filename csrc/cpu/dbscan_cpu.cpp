@@ -23,7 +23,13 @@ inline void split_xy(const float* data, int32_t n, std::vector<float>& xs,
 
 }  // namespace
 
-torch::Tensor dbscan2d_cpu(torch::Tensor X, double eps, int64_t min_samples) {
+namespace {
+
+// Shared core: runs the grid algorithm, returning labels. Optionally fills
+// per-stage timings when ``timings`` is non-null. The split-xy + label copy
+// are CPU torch boilerplate that doesn't belong in the timed region.
+inline torch::Tensor run_cpu(torch::Tensor X, double eps, int64_t min_samples,
+                             dbscan_grid::Timings* timings) {
   TORCH_CHECK(X.is_cpu(), "dbscan2d_cpu expects a CPU tensor");
   TORCH_CHECK(X.scalar_type() == torch::kFloat32, "X must be float32");
   TORCH_CHECK(X.dim() == 2 && X.size(1) == 2, "X must have shape (N, 2)");
@@ -41,10 +47,27 @@ torch::Tensor dbscan2d_cpu(torch::Tensor X, double eps, int64_t min_samples) {
     pybind11::gil_scoped_release release;
     result = dbscan_grid::dbscan2d(xs.data(), ys.data(), n,
                                    static_cast<float>(eps),
-                                   static_cast<int32_t>(min_samples));
+                                   static_cast<int32_t>(min_samples), timings);
   }
 
   std::copy(result.labels.begin(), result.labels.end(),
             labels.data_ptr<int32_t>());
   return labels;
+}
+
+}  // namespace
+
+torch::Tensor dbscan2d_cpu(torch::Tensor X, double eps, int64_t min_samples) {
+  return run_cpu(std::move(X), eps, min_samples, /*timings=*/nullptr);
+}
+
+std::pair<torch::Tensor, std::map<std::string, float>>
+dbscan2d_cpu_profile(torch::Tensor X, double eps, int64_t min_samples) {
+  dbscan_grid::Timings timings;
+  auto labels = run_cpu(std::move(X), eps, min_samples, &timings);
+  std::map<std::string, float> out;
+  for (int i = 0; i < dbscan_grid::Timings::N; ++i) {
+    out[dbscan_grid::kStageNames[i]] = static_cast<float>(timings.ms[i]);
+  }
+  return {labels, out};
 }

@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-08
+
+### Fixed
+- CUDA `dbscan2d` is now deterministic. A write-write race in the cell-level
+  union-find (path-halving `find` inside the flatten kernel racing other
+  threads' halving writes) could leave a cell pointing at a non-root,
+  changing cluster membership for ~0.3-0.5% of points between identical runs
+  on dense inputs. The flatten kernel now uses a read-only find. Full
+  investigation in `docs/cuda-determinism-fix.md`.
+
+### Changed
+- Dense-data performance: per-cell point bounding boxes now gate the
+  neighbor-cell scans (core marking pass 2, cell union, border assignment),
+  skipping scans that provably cannot contain a pair within eps. Runtime no
+  longer depends materially on the data distribution: on an RTX 3090 at
+  N=10M, overlapping blobs went from 22.1s to 12ms, an elongated single
+  cluster from 2.5s to 10ms, dense blobs from 767ms to 10ms, and uniform
+  from 41ms to 30ms. CPU improves 1.1-2.5x on the same dense cases.
+- `k_unite_pairs` skips cell pairs already in the same component via a
+  read-only root check before scanning.
+- The CUDA neighbor-table kernel uses a flat thread-per-(cell, offset)
+  mapping instead of one underfilled block per cell (previously the top
+  stage on uniform data).
+
+### Added
+- `_C.dbscan2d_profile`: same dispatch as `dbscan2d`, additionally returns
+  per-stage timings (CUDA events on GPU, wallclock on CPU) for
+  attribution-driven optimization.
+- `_C.dbscan2d_cuda_debug`: returns per-stage intermediate tensors for
+  divergence debugging. Not part of the public API.
+- Determinism regression tests (bit-identical labels across repeated runs on
+  both devices) and eps-boundary tests pinning the pruning against the
+  float32 distance rule, plus a brute-force parity test on dense data.
+
 ## [0.1.1] - 2026-05-10
 
 ### Added
@@ -42,5 +76,7 @@ Initial release.
 - CPU/CUDA bit-parity test on synthetic data.
 - PEP 561 typing marker (`py.typed`) with inline annotations.
 
-[Unreleased]: https://github.com/ryanirl/dbscan-torch/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/ryanirl/dbscan-torch/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/ryanirl/dbscan-torch/compare/v0.1.1...v0.2.0
+[0.1.1]: https://github.com/ryanirl/dbscan-torch/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/ryanirl/dbscan-torch/releases/tag/v0.1.0
