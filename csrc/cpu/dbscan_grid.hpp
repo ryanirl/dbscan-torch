@@ -31,7 +31,6 @@
 #include <cmath>
 #include <cstdint>
 #include <numeric>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -40,14 +39,19 @@ namespace dbscan_grid {
 constexpr int32_t kNoise = -1;
 
 inline uint64_t cell_key(int32_t kx, int32_t ky) {
-  return (static_cast<uint64_t>(static_cast<uint32_t>(kx)) << 32) |
-         static_cast<uint32_t>(ky);
+  // The sign bit is XORed into both coords so unsigned key order equals
+  // signed (kx, ky) lexicographic order. The neighbor-table build walks
+  // contiguous ky-windows in the sorted key array; without the bias a
+  // window crossing ky = 0 splits into two runs and neighbors near the
+  // axes would be silently missed.
+  return (static_cast<uint64_t>(static_cast<uint32_t>(kx) ^ 0x80000000u) << 32) |
+         (static_cast<uint32_t>(ky) ^ 0x80000000u);
 }
 
 // Inverse of cell_key: extracts (kx, ky) from a packed uint64.
 inline std::pair<int32_t, int32_t> unpack_cell_key(uint64_t k) {
-  return {static_cast<int32_t>(static_cast<uint32_t>(k >> 32)),
-          static_cast<int32_t>(static_cast<uint32_t>(k))};
+  return {static_cast<int32_t>(static_cast<uint32_t>(k >> 32) ^ 0x80000000u),
+          static_cast<int32_t>(static_cast<uint32_t>(k) ^ 0x80000000u)};
 }
 
 struct Result {
@@ -202,55 +206,137 @@ inline Result dbscan2d(const float* xs_in, const float* ys_in, int32_t n,
   stage_end(1);
 
   // ---------------------------------------------------------------- stage 3
-  // Cell boundaries -- sequential walk over sorted_keys (cache-friendly).
-  std::vector<int32_t> cell_start;
-  std::vector<int32_t> cell_kx, cell_ky;
-  cell_start.reserve(n / 64 + 1);
-  cell_start.push_back(0);
+  // Cell boundaries. Deterministic chunked two-pass scan: count boundary
+  // flags per fixed chunk, prefix the chunk counts sequentially (tiny),
+  // then fill. The chunk grid depends only on n -- never on the thread
+  // count -- so the output is bit-identical under any parallelism.
+  const int64_t num_chunks = std::min<int64_t>(256, std::max<int64_t>(1, n));
+  auto chunk_lo = [&](int64_t chunk) {
+    return 1 + (static_cast<int64_t>(n) - 1) * chunk / num_chunks;
+  };
+  std::vector<int64_t> chunk_offset(num_chunks + 1, 0);
+  at::parallel_for(0, num_chunks, 1, [&](int64_t b, int64_t e) {
+    for (int64_t chunk = b; chunk < e; ++chunk) {
+      int64_t count = 0;
+      for (int64_t i = chunk_lo(chunk); i < chunk_lo(chunk + 1); ++i) {
+        count += (sorted_keys[i] != sorted_keys[i - 1]);
+      }
+      chunk_offset[chunk + 1] = count;
+    }
+  });
+  for (int64_t chunk = 0; chunk < num_chunks; ++chunk) {
+    chunk_offset[chunk + 1] += chunk_offset[chunk];
+  }
+
+  const int32_t num_cells = static_cast<int32_t>(chunk_offset[num_chunks]) + 1;
+  std::vector<int32_t> cell_start(static_cast<size_t>(num_cells) + 1);
+  std::vector<int32_t> cell_kx(num_cells), cell_ky(num_cells);
+  cell_start[0] = 0;
+  cell_start[num_cells] = n;
   {
     auto [kx0, ky0] = unpack_cell_key(sorted_keys[0]);
-    cell_kx.push_back(kx0);
-    cell_ky.push_back(ky0);
+    cell_kx[0] = kx0;
+    cell_ky[0] = ky0;
   }
-  uint64_t prev_key = sorted_keys[0];
-  for (int32_t i = 1; i < n; ++i) {
-    uint64_t k = sorted_keys[i];
-    if (k != prev_key) {
-      cell_start.push_back(i);
-      auto [kx, ky] = unpack_cell_key(k);
-      cell_kx.push_back(kx);
-      cell_ky.push_back(ky);
-      prev_key = k;
-    }
-  }
-  cell_start.push_back(n);
-  const int32_t num_cells = static_cast<int32_t>(cell_kx.size());
-
-  // Hashmap: cell key -> cell index. Sequential build (small).
-  std::unordered_map<uint64_t, int32_t> cell_lookup;
-  cell_lookup.reserve(static_cast<size_t>(num_cells * 2));
-  for (int32_t c = 0; c < num_cells; ++c) {
-    cell_lookup.emplace(cell_key(cell_kx[c], cell_ky[c]), c);
-  }
-  stage_end(2);
-
-  // ---------------------------------------------------------------- stage 4
-  // 5x5 neighbor table per cell. Parallel.
-  std::vector<int32_t> ngh(static_cast<size_t>(num_cells) * 25, -1);
-  at::parallel_for(0, num_cells, 256, [&](int64_t b, int64_t e) {
-    for (int64_t c = b; c < e; ++c) {
-      const int32_t kx = cell_kx[c], ky = cell_ky[c];
-      int32_t* row = ngh.data() + size_t(c) * 25;
-      for (int32_t dx = -2; dx <= 2; ++dx) {
-        for (int32_t dy = -2; dy <= 2; ++dy) {
-          auto it = cell_lookup.find(cell_key(kx + dx, ky + dy));
-          row[(dx + 2) * 5 + (dy + 2)] =
-              (it == cell_lookup.end()) ? -1 : it->second;
+  at::parallel_for(0, num_chunks, 1, [&](int64_t b, int64_t e) {
+    for (int64_t chunk = b; chunk < e; ++chunk) {
+      int64_t c = chunk_offset[chunk] + 1;
+      for (int64_t i = chunk_lo(chunk); i < chunk_lo(chunk + 1); ++i) {
+        if (sorted_keys[i] != sorted_keys[i - 1]) {
+          cell_start[c] = static_cast<int32_t>(i);
+          auto [kx, ky] = unpack_cell_key(sorted_keys[i]);
+          cell_kx[c] = kx;
+          cell_ky[c] = ky;
+          ++c;
         }
       }
     }
   });
-  std::unordered_map<uint64_t, int32_t>().swap(cell_lookup);
+
+  stage_end(2);
+
+  // ---------------------------------------------------------------- stage 4
+  // 5x5 neighbor table via column-pair merge-join. Cells sharing a kx form
+  // a contiguous, ky-sorted run ("column"); after the signed-int64 sort of
+  // sign-biased keys the columns themselves are ordered by uint32(kx). For
+  // each (column, dx) pair a single two-pointer walk over the two ky-sorted
+  // runs fills every cell's row in O(cells) sequential access -- no
+  // per-cell hashmap probes or binary searches (whose scattered loads
+  // dominated this stage).
+  std::vector<int32_t> col_of_kx_start;
+  {
+    std::vector<int64_t> col_chunk(num_chunks + 1, 0);
+    const int64_t cell_chunks = std::min<int64_t>(num_chunks, num_cells);
+    auto ccl = [&](int64_t chunk) {
+      return 1 + (static_cast<int64_t>(num_cells) - 1) * chunk / cell_chunks;
+    };
+    at::parallel_for(0, cell_chunks, 1, [&](int64_t b, int64_t e) {
+      for (int64_t chunk = b; chunk < e; ++chunk) {
+        int64_t count = 0;
+        for (int64_t c = ccl(chunk); c < ccl(chunk + 1); ++c) {
+          count += (cell_kx[c] != cell_kx[c - 1]);
+        }
+        col_chunk[chunk + 1] = count;
+      }
+    });
+    for (int64_t chunk = 0; chunk < cell_chunks; ++chunk) {
+      col_chunk[chunk + 1] += col_chunk[chunk];
+    }
+    const int32_t num_columns =
+        static_cast<int32_t>(col_chunk[cell_chunks]) + 1;
+    col_of_kx_start.assign(static_cast<size_t>(num_columns) + 1, 0);
+    col_of_kx_start[num_columns] = num_cells;
+    at::parallel_for(0, cell_chunks, 1, [&](int64_t b, int64_t e) {
+      for (int64_t chunk = b; chunk < e; ++chunk) {
+        int64_t col = col_chunk[chunk] + 1;
+        for (int64_t c = ccl(chunk); c < ccl(chunk + 1); ++c) {
+          if (cell_kx[c] != cell_kx[c - 1]) {
+            col_of_kx_start[col] = static_cast<int32_t>(c);
+            ++col;
+          }
+        }
+      }
+    });
+  }
+  const int32_t num_columns =
+      static_cast<int32_t>(col_of_kx_start.size()) - 1;
+
+  std::vector<int32_t> ngh(static_cast<size_t>(num_cells) * 25, -1);
+  at::parallel_for(0, num_columns, 1, [&](int64_t b, int64_t e) {
+    for (int64_t ci = b; ci < e; ++ci) {
+      const int32_t a_lo = col_of_kx_start[ci], a_hi = col_of_kx_start[ci + 1];
+      const int32_t kx = cell_kx[a_lo];
+      for (int32_t dx = -2; dx <= 2; ++dx) {
+        // Locate the kx + dx column: columns are sorted by uint32(kx), and
+        // comparing in that order handles negative kx and the int-boundary
+        // wraparound uniformly.
+        auto col_less = [&](int32_t col, int32_t target_kx) {
+          return static_cast<uint32_t>(cell_kx[col_of_kx_start[col]]) <
+                 static_cast<uint32_t>(target_kx);
+        };
+        int32_t lo = 0, hi = num_columns;
+        while (lo < hi) {
+          int32_t mid = (lo + hi) >> 1;
+          if (col_less(mid, kx + dx)) lo = mid + 1;
+          else hi = mid;
+        }
+        if (lo >= num_columns || cell_kx[col_of_kx_start[lo]] != kx + dx) {
+          continue;
+        }
+
+        const int32_t b_hi = col_of_kx_start[lo + 1];
+        int32_t j = col_of_kx_start[lo];
+        for (int32_t a = a_lo; a < a_hi; ++a) {
+          const int32_t ky = cell_ky[a];
+          while (j < b_hi && cell_ky[j] < ky - 2) ++j;
+          int32_t* row = ngh.data() + size_t(a) * 25;
+          for (int32_t jj = j; jj < b_hi && cell_ky[jj] <= ky + 2; ++jj) {
+            row[(dx + 2) * 5 + (cell_ky[jj] - ky + 2)] = jj;
+          }
+        }
+      }
+    }
+  });
   stage_end(3);
 
   // ---------------------------------------------------------------- stage 5

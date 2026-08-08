@@ -315,18 +315,33 @@ __global__ void k_uf_init(int32_t* uf, int32_t num_cells) {
   if (c < num_cells) uf[c] = c;
 }
 
+// The 24 neighbor offsets of the 5x5 stencil, grouped by Chebyshev ring.
+// Ring 1 (the 8 touching neighbors) is launched first: it alone connects
+// nearly every cluster, so by the time ring 2 (the 16 outer offsets, whose
+// geometric gap is close to eps and whose scans are the expensive ones)
+// launches, almost all of its pairs exit at the already-united check.
+__device__ const int32_t kRing1Offsets[8] = {6, 7, 8, 11, 13, 16, 17, 18};
+__device__ const int32_t kRing2Offsets[16] = {0,  1,  2,  3,  4,  5,  9, 10,
+                                              14, 15, 19, 20, 21, 22, 23, 24};
+
+// Flat thread-per-(cell, ring offset) mapping: full blocks, no per-cell
+// block-dispatch overhead (with millions of near-empty cells the old
+// one-block-per-cell launch made this kernel dispatch-bound).
 __global__ void k_unite_pairs(const float* __restrict__ xs,
                               const float* __restrict__ ys,
                               const int32_t* __restrict__ cell_start,
                               const uint8_t* __restrict__ is_core,
                               const uint8_t* __restrict__ cell_status,
                               const int32_t* __restrict__ ngh,
-                              const float4* __restrict__ bbox,
+                              const float4* __restrict__ bbox, int32_t ring,
                               int32_t num_cells, float eps_sq,
                               int32_t* __restrict__ uf) {
-  int32_t c = blockIdx.x;
-  int32_t off = threadIdx.x;
-  if (c >= num_cells || off >= 25 || off == 12) return;
+  const int32_t* ring_offsets = (ring == 1) ? kRing1Offsets : kRing2Offsets;
+  const int32_t ring_count = (ring == 1) ? 8 : 16;
+  int64_t t = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (t >= static_cast<int64_t>(num_cells) * ring_count) return;
+  int32_t c = static_cast<int32_t>(t / ring_count);
+  int32_t off = ring_offsets[t % ring_count];
   if (cell_status[c] == 0) return;
   int32_t nc = ngh[c * 25 + off];
   if (nc <= c) return;  // each undirected pair processed once (lower -> higher)
@@ -676,15 +691,25 @@ static torch::Tensor dbscan2d_cuda_impl(torch::Tensor X, double eps,
   k_uf_init<<<grid(num_cells), kBlk, 0, stream>>>(uf.data_ptr<int32_t>(),
                                                   num_cells);
 
-  k_unite_pairs<<<num_cells, 32, 0, stream>>>(
-      xs.data_ptr<float>(), ys.data_ptr<float>(),
-      cell_start.data_ptr<int32_t>(), is_core.data_ptr<uint8_t>(),
-      cell_status.data_ptr<uint8_t>(), ngh.data_ptr<int32_t>(),
-      reinterpret_cast<const float4*>(bbox.data_ptr<float>()), num_cells,
-      eps_sq, uf.data_ptr<int32_t>());
-
-  k_uf_flatten<<<grid(num_cells), kBlk, 0, stream>>>(uf.data_ptr<int32_t>(),
-                                                     num_cells);
+  // Two-phase unite: ring 1 connects nearly everything, the flatten in
+  // between makes the already-united check O(1) for ring 2, which then
+  // skips most of the expensive near-eps pair scans. The union outcome is
+  // order-independent, so the partition (and labels) are unchanged.
+  auto launch_unite = [&](int32_t ring, int32_t ring_count) {
+    const int64_t unite_threads = static_cast<int64_t>(num_cells) * ring_count;
+    const int32_t unite_blocks =
+        static_cast<int32_t>((unite_threads + kBlk - 1) / kBlk);
+    k_unite_pairs<<<unite_blocks, kBlk, 0, stream>>>(
+        xs.data_ptr<float>(), ys.data_ptr<float>(),
+        cell_start.data_ptr<int32_t>(), is_core.data_ptr<uint8_t>(),
+        cell_status.data_ptr<uint8_t>(), ngh.data_ptr<int32_t>(),
+        reinterpret_cast<const float4*>(bbox.data_ptr<float>()), ring,
+        num_cells, eps_sq, uf.data_ptr<int32_t>());
+    k_uf_flatten<<<grid(num_cells), kBlk, 0, stream>>>(uf.data_ptr<int32_t>(),
+                                                       num_cells);
+  };
+  launch_unite(1, 8);
+  launch_unite(2, 16);
   if (dbg) { dbg->uf = uf; }
 
   // ---------------------------------------------------------------- stage 7
