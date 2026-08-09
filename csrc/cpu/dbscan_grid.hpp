@@ -690,7 +690,13 @@ inline Result dbscan2d(const float* xs_in, const float* ys_in, int32_t n,
       const int32_t c = point_cell[i];
       const int32_t* row = ngh.data() + size_t(c) * 25;
       const float xi = xs[i], yi = ys[i];
-      float best_d2 = eps_sq + 1.0f;  // strict-better criterion below
+      // Tiebreak mirrors the CUDA kernel: lexicographic minimum of
+      // (d2, perm[j]), so an exact-distance tie goes to the core with the
+      // smallest ORIGINAL index. Without the index term, ties would fall to
+      // scan order, which depends on the stencil layout and on the sort's
+      // ordering of duplicate keys -- not a portable contract.
+      float best_d2 = eps_sq + 1.0f;
+      int32_t best_perm = 0x7FFFFFFF;
       int32_t best_lab = kNoise;
       for (int32_t off = 0; off < 25; ++off) {
         const int32_t nc = row[off];
@@ -702,8 +708,11 @@ inline Result dbscan2d(const float* xs_in, const float* ys_in, int32_t n,
           if (!is_core[j]) continue;
           const float ex = xs[j] - xi, ey = ys[j] - yi;
           const float d2 = ex * ex + ey * ey;
-          if (d2 <= eps_sq && d2 < best_d2) {
+          if (d2 > eps_sq) continue;
+          const int32_t pj = perm[j];
+          if (d2 < best_d2 || (d2 == best_d2 && pj < best_perm)) {
             best_d2 = d2;
+            best_perm = pj;
             best_lab = sorted_labels[j];
           }
         }

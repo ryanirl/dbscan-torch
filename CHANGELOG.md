@@ -29,9 +29,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Cluster ids can renumber relative to 0.2.0 (cell visit order changed);
   partitions are unchanged and runs remain bit-deterministic.
 
+### Fixed
+- The CPU border assignment now breaks exact-distance ties by smallest
+  original index, matching the rule the CUDA kernel has always implemented
+  and documented. Previously CPU ties fell to internal scan order, which
+  depended on the stencil layout and the sort's ordering of duplicate
+  points and was therefore not portable across torch versions. Affects
+  only border points exactly equidistant from two cores (duplicates,
+  gridded coordinates).
+
 ### Added
 - Wide-grid fallback regression tests (inputs spanning more than 2^16
   cells per axis above the narrow-key detection thresholds).
+- Border tiebreak regression test (a probe exactly eps from two cores must
+  join the smaller-original-index core's cluster on both devices).
 
 ## [0.2.0] - 2026-08-08
 
